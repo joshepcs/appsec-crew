@@ -103,6 +103,10 @@ If you **omit** `--config`:
 
 An explicit `--config /path` must point to an existing file.
 
+### GitHub Actions path (`…/work/repo/repo`)
+
+`GITHUB_WORKSPACE` is always `/home/runner/work/<repo-name>/<repo-name>`. The path is **not** duplicated by mistake: the first segment is the workflow “share”, the second is the clone directory ([GitHub Actions reference](https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables)).
+
 ### Scanner workspace, logging, triage, and CLI overrides
 
 - **Scope**: Betterleaks runs `dir` on the repository root (full tree), OSV uses `scan -r`, Semgrep uses `scan` on the repo path (recursive by default).
@@ -110,6 +114,10 @@ An explicit `--config /path` must point to an existing file.
 - **False positives**: Optional **LLM triage** (`llm_triage: true` under each tool block) can dismiss likely false positives after scanning. **Default is off** so CI matches raw scanner output unless you opt in.
 - **Semgrep severity**: `global.min_severity` filters by rule severity. **`WARNING` counts like HIGH/ERROR** (rank 4) for the `high` threshold — Semgrep labels many real issues as WARNING. Missing / unknown severities default to HIGH. Explicit `INFO` / `LOW` / `MEDIUM` use the usual map.
 - **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted `--config …` tokens) and `{autofix}` (`--autofix ` or empty). Put a **space before `--json`** in custom Semgrep templates, e.g. `… {config_args} --json -o {report} {repo}`.
+
+### CI: Semgrep shows 0 findings in GitHub Actions
+
+Semgrep only scans **Git-tracked files** and shells out to `git`. On runners, Git 2.35.2+ may treat the checkout as unsafe unless `safe.directory` is set — then **no files** match and you get **0 results** while local scans still work. The reusable workflow runs `git config --global --add safe.directory '*'` before `appsec-crew`. For custom workflows, mirror that or see [Semgrep: git command errors](https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors). If problems persist, check job logs for `[appsec-crew] semgrep:` lines (scanned file count + stderr tail).
 
 ---
 

@@ -66,6 +66,11 @@ jobs:
           ref: ${{ inputs.appsec_crew_ref }}
           path: .appsec-crew-checkout
 
+      # Semgrep walks Git-tracked files; without this, `git` may refuse the checkout after Git 2.35.2+ and the
+      # scan sees zero files (0 results). See: https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors
+      - name: Git safe.directory (Semgrep / git-aware tools)
+        run: git config --global --add safe.directory '*'
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

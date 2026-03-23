@@ -143,6 +143,25 @@ def run_semgrep(
         for err in errs[:8]:
             print(f"[appsec-crew] semgrep engine error: {err!r}", file=sys.stderr, flush=True)
     res = data.get("results")
+    findings_list: list[dict[str, Any]] = []
     if isinstance(res, list):
-        return [x for x in res if isinstance(x, dict)]
-    return []
+        findings_list = [x for x in res if isinstance(x, dict)]
+    if not findings_list:
+        paths = data.get("paths")
+        scanned_n: int | None = None
+        if isinstance(paths, dict):
+            sc = paths.get("scanned")
+            if isinstance(sc, list):
+                scanned_n = len(sc)
+        # Only escalate when Semgrep scanned nothing (or omitted paths): typical of git safe.directory / git errors.
+        if scanned_n == 0 or scanned_n is None:
+            print(
+                f"[appsec-crew] semgrep: 0 findings and no scanned-file list (or 0 files); "
+                f"returncode={proc.returncode}. If this is CI, ensure `git config --global --add safe.directory \"*\"` "
+                f"or see https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors",
+                file=sys.stderr,
+                flush=True,
+            )
+            if stderr:
+                print(f"[appsec-crew] semgrep stderr (tail): {stderr[-6000:]}", file=sys.stderr, flush=True)
+    return findings_list
