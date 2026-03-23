@@ -108,7 +108,7 @@ An explicit `--config /path` must point to an existing file.
 - **Scope**: Betterleaks runs `dir` on the repository root (full tree), OSV uses `scan -r`, Semgrep uses `scan` on the repo path (recursive by default).
 - **Logging**: Each subprocess prints a line to **stderr**: `[appsec-crew] executing: {"tool":"…","argv":[…],"shell":"…"}` plus the same argv is stored in workflow JSON as `commands_executed`.
 - **False positives**: After native filters (e.g. `.betterleaks.toml`, `osv-scanner.toml`, severity floors), an optional **LLM triage** pass (same model/keys as the agent) can dismiss likely false positives. Set `llm_triage: false` under `tools.betterleaks`, `tools.osv_scanner`, or `tools.semgrep` to skip it.
-- **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted bundle of `--config …`) and `{autofix}` (`--autofix ` or empty). See comments in `appsec_crew.yaml` / `bundled_appsec_crew.yaml`.
+- **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted `--config …` tokens) and `{autofix}` (`--autofix ` or empty). Put a **space before `--json`** in custom Semgrep templates, e.g. `… {config_args} --json -o {report} {repo}`.
 
 ---
 

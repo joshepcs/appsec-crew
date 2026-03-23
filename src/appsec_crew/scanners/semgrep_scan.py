@@ -73,7 +73,8 @@ def build_semgrep_command(
     """
     Default: ``semgrep scan`` over ``repo`` (recursive workspace scan by Semgrep).
     Optional ``command_template``: placeholders ``{binary}``, ``{repo}``, ``{report}``,
-    ``{config_args}`` (single string of quoted ``--config …`` tokens), ``{autofix}`` (``--autofix `` or empty).
+    ``{config_args}`` (quoted ``--config …`` tokens), ``{autofix}`` (``--autofix `` or empty).
+    Include a literal space before ``--json`` in the template (e.g. ``… {config_args} --json -o {report}``).
     """
     cfg_flat = " ".join(shlex.quote(x) for x in config_args)
     autofix_part = "--autofix " if autofix else ""

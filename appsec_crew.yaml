@@ -20,7 +20,8 @@
 # Tool CLI overrides (per agent `tools` block):
 #   - betterleaks: `extra_args` (list), `command` (optional full template: {binary} {repo} {report} {config})
 #   - osv_scanner: `scan_extra_args`, `scan_command`, `fix_extra_args` (same placeholders + {config} on scan)
-#   - semgrep: `extra_args`, `command` with {binary} {repo} {report} {config_args} {autofix} ({autofix} is "--autofix " or "")
+#   - semgrep: `extra_args`, `command` — include a space before `--json`, e.g.
+#     "{binary} scan {autofix}{config_args} --json -o {report} {repo}"
 #   - `llm_triage: false` under a tool disables the false-positive triage pass for that agent (default true).
 
 global:

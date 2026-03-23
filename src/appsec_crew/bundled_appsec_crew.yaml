@@ -49,7 +49,7 @@ agents:
         binary: semgrep
         config_path: null
         # extra_args: []
-        # command: null          # "{binary} scan {autofix}{config_args}--json -o {report} {repo}"
+        # command: null          # "{binary} scan {autofix}{config_args} --json -o {report} {repo}"
         # llm_triage: true
         extra_configs:
           - auto
