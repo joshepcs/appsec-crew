@@ -11,7 +11,6 @@ from typing import Any
 
 from appsec_crew.scanners.subprocess_run import run_scanner
 
-
 LANG_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "python": (".py", ".pyi"),
     "javascript": (".js", ".jsx", ".mjs", ".cjs"),
@@ -72,17 +71,18 @@ def build_semgrep_command(
     command_template: str | None = None,
 ) -> list[str]:
     """
-    Default: ``semgrep scan`` over ``repo`` (recursive workspace scan by Semgrep).
+    Default: ``semgrep scan`` with ``cwd`` set to the resolved repo root and scan target ``{repo}`` (absolute path).
+
     Optional ``command_template``: placeholders ``{binary}``, ``{repo}``, ``{report}``,
-    ``{config_args}`` (quoted ``--config …`` tokens), ``{autofix}`` (``--autofix `` or empty).
-    Include a literal space before ``--json`` in the template (e.g. ``… {config_args} --json -o {report}``).
+    ``{config_args}``, ``{autofix}``. Include a space before ``--json`` where needed.
     """
+    root = repo.resolve()
     cfg_flat = " ".join(shlex.quote(x) for x in config_args)
     autofix_part = "--autofix " if autofix else ""
     if command_template and str(command_template).strip():
         s = str(command_template).format(
             binary=binary,
-            repo=str(repo),
+            repo=str(root),
             report=str(report_path),
             config_args=cfg_flat,
             autofix=autofix_part,
@@ -94,7 +94,7 @@ def build_semgrep_command(
     cmd += list(config_args)
     if extra_args:
         cmd += list(extra_args)
-    cmd += ["--json", "-o", str(report_path), str(repo)]
+    cmd += ["--json", "-o", str(report_path), str(root)]
     return cmd
 
 
@@ -109,8 +109,9 @@ def run_semgrep(
     command_template: str | None = None,
     commands_log: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    root = repo.resolve()
     cmd = build_semgrep_command(
-        repo,
+        root,
         binary,
         config_args,
         report_path,
@@ -118,20 +119,17 @@ def run_semgrep(
         extra_args=extra_args,
         command_template=command_template,
     )
-    proc = run_scanner(cmd, cwd=repo, tool_label="semgrep", commands_log=commands_log)
-    stderr = (proc.stderr or "").strip()
-    if stderr and proc.returncode not in (0, 1):
+    proc = run_scanner(cmd, cwd=root, tool_label="semgrep", commands_log=commands_log)
+    if not report_path.is_file():
         print(
-            f"[appsec-crew] semgrep exit={proc.returncode} stderr (truncated): {stderr[:8000]}",
+            f"[appsec-crew] semgrep: report file missing: {report_path} returncode={proc.returncode}",
             file=sys.stderr,
             flush=True,
         )
-    if not report_path.is_file():
-        if stderr:
-            print(f"[appsec-crew] semgrep: no report file; stderr: {stderr[:4000]}", file=sys.stderr, flush=True)
         return []
     raw = report_path.read_text(encoding="utf-8", errors="replace").strip()
     if not raw:
+        print("[appsec-crew] semgrep: report file empty", file=sys.stderr, flush=True)
         return []
     try:
         data = json.loads(raw)
@@ -139,29 +137,14 @@ def run_semgrep(
         print(f"[appsec-crew] semgrep: invalid JSON report: {e}", file=sys.stderr, flush=True)
         return []
     errs = data.get("errors")
-    if isinstance(errs, list) and errs:
-        for err in errs[:8]:
+    err_list = errs if isinstance(errs, list) else []
+    if err_list:
+        for err in err_list[:8]:
             print(f"[appsec-crew] semgrep engine error: {err!r}", file=sys.stderr, flush=True)
     res = data.get("results")
+    if res is None:
+        res = []
     findings_list: list[dict[str, Any]] = []
     if isinstance(res, list):
         findings_list = [x for x in res if isinstance(x, dict)]
-    if not findings_list:
-        paths = data.get("paths")
-        scanned_n: int | None = None
-        if isinstance(paths, dict):
-            sc = paths.get("scanned")
-            if isinstance(sc, list):
-                scanned_n = len(sc)
-        # Only escalate when Semgrep scanned nothing (or omitted paths): typical of git safe.directory / git errors.
-        if scanned_n == 0 or scanned_n is None:
-            print(
-                f"[appsec-crew] semgrep: 0 findings and no scanned-file list (or 0 files); "
-                f"returncode={proc.returncode}. If this is CI, ensure `git config --global --add safe.directory \"*\"` "
-                f"or see https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors",
-                file=sys.stderr,
-                flush=True,
-            )
-            if stderr:
-                print(f"[appsec-crew] semgrep stderr (tail): {stderr[-6000:]}", file=sys.stderr, flush=True)
     return findings_list

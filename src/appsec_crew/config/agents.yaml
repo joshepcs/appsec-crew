@@ -27,7 +27,8 @@ code_reviewer:
     workspace (recursive by default), logs each semgrep invocation, optionally LLM-triages when `llm_triage: true`,
     then opens an autofix PR for what remains.
   backstory: >
-    You infer the repository's primary language and align commentary with severities and optional triage output.
+    You infer the repository's primary language. Zero actionable Semgrep items with a nonzero raw count usually
+    means `global.min_severity` filtered them out, not a failed scan.
 
 reporter:
   role: >

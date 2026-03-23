@@ -115,9 +115,11 @@ An explicit `--config /path` must point to an existing file.
 - **Semgrep severity**: `global.min_severity` filters by rule severity. **`WARNING` counts like HIGH/ERROR** (rank 4) for the `high` threshold — Semgrep labels many real issues as WARNING. Missing / unknown severities default to HIGH. Explicit `INFO` / `LOW` / `MEDIUM` use the usual map.
 - **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted `--config …` tokens) and `{autofix}` (`--autofix ` or empty). Put a **space before `--json`** in custom Semgrep templates, e.g. `… {config_args} --json -o {report} {repo}`.
 
-### CI: Semgrep shows 0 findings in GitHub Actions
+### CI: “0 Semgrep findings” vs `global.min_severity`
 
-Semgrep only scans **Git-tracked files** and shells out to `git`. On runners, Git 2.35.2+ may treat the checkout as unsafe unless `safe.directory` is set — then **no files** match and you get **0 results** while local scans still work. The reusable workflow runs `git config --global --add safe.directory '*'` before `appsec-crew`. For custom workflows, mirror that or see [Semgrep: git command errors](https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors). If problems persist, check job logs for `[appsec-crew] semgrep:` lines (scanned file count + stderr tail).
+The summary line **raw from scan** is the Semgrep JSON **before** `global.min_severity`; **after severity filter** is after that gate; **findings** is after LLM triage (if enabled). If **raw > 0** but counts after the severity line are **0**, relax `global.min_severity` (e.g. `high` → `medium`) or adjust rules — the scanner is working; the gate is policy. If **raw is 0** and you expected issues, check rules/registry access and that files are tracked (Semgrep uses `git` by default).
+
+The reusable workflow runs `git config --global --add safe.directory '*'` so Git 2.35.2+ does not block the checkout and Semgrep sees tracked files ([Semgrep: git command errors](https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors)). To change how targets are chosen (e.g. `--novcs`, `--no-git-ignore`, `--scan-unknown-extensions`), use `extra_args` or a custom `command` — see the [Semgrep CLI reference](https://semgrep.dev/docs/cli-reference).
 
 ---
 
