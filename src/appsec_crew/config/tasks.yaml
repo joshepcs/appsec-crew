@@ -1,0 +1,27 @@
+secrets_reviewer_task:
+  description: >
+    Call the tool `secrets_reviewer_workflow` a single time. Do not invent findings; rely on tool output only.
+  expected_output: >
+    JSON summary string from the tool including issue URLs and finding counts.
+  agent: secrets_reviewer
+
+dependencies_reviewer_task:
+  description: >
+    Call the tool `dependencies_reviewer_workflow` a single time after secrets work finished.
+  expected_output: >
+    JSON summary string from the tool including optional PR URL.
+  agent: dependencies_reviewer
+
+code_reviewer_task:
+  description: >
+    Call the tool `code_reviewer_workflow` a single time after dependency review finished.
+  expected_output: >
+    JSON summary string from the tool including primary language and optional PR URL.
+  agent: code_reviewer
+
+reporter_task:
+  description: >
+    Call the tool `reporter_workflow` a single time last to publish the consolidated summary.
+  expected_output: >
+    Markdown summary suitable for GitHub comments.
+  agent: reporter

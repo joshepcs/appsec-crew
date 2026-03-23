@@ -1,0 +1,94 @@
+# AppSec Crew — configuration template.
+#
+# Usage:
+#   - Copy to `appsec_crew.yaml` at the root of the repository you scan and customize it.
+#   - If `appsec_crew.yaml` is missing, the CLI loads the packaged `bundled_appsec_crew.yaml`
+#     (same baseline): reporter integrations (Jira, webhook, Splunk) stay disabled.
+#
+# Precedence: non-empty YAML values override environment variables for secrets.
+#
+# CrewAI: every enabled agent needs `llm.api_key` or `llm.api_key_env`.
+#
+# Exceptions / allowlists: use each tool's native config in the scanned repository:
+#   - Betterleaks / Gitleaks: `.betterleaks.toml` or `.gitleaks.toml`
+#   - OSV-Scanner: `osv-scanner.toml` (see examples/osv-scanner.toml.example)
+#   - Semgrep: `.semgrep.yml` (see examples/semgrep-local-rules.example.yml)
+
+global:
+  # Minimum severity for dependency (CVSS) and Semgrep findings.
+  # Values: critical | high | medium | low
+  min_severity: high
+  github:
+    token_env: GITHUB_TOKEN
+    # token: use only if you must override GITHUB_TOKEN from a secret manager (never commit real tokens).
+
+agents:
+  secrets_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      base_url: null
+      temperature: 0
+    tools:
+      betterleaks:
+        binary: betterleaks
+        config_path: null
+
+  dependencies_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    tools:
+      osv_scanner:
+        binary: osv-scanner
+        config_path: null
+
+  code_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    tools:
+      semgrep:
+        binary: semgrep
+        config_path: null
+        extra_configs:
+          - auto
+          - p/security-audit
+          - p/python
+          - p/javascript
+          - p/typescript
+          - p/java
+          - p/go
+          - p/rust
+
+  reporter:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    tools:
+      # In this template and in the bundled default: no Jira / webhook / Splunk.
+      # Enable them here when you maintain your own `appsec_crew.yaml`.
+      jira:
+        enabled: false
+        base_url: https://your-company.atlassian.net
+        project_key: SEC
+        issue_type: Task
+        email_env: JIRA_EMAIL
+        api_token_env: JIRA_API_TOKEN
+      webhook:
+        enabled: false
+        url_env: APPSEC_WEBHOOK_URL
+        url: ""
+        headers: {}
+        header_secrets: {}
+      splunk:
+        enabled: false
+        hec_url_env: SPLUNK_HEC_URL
+        hec_url: ""
+        token_env: SPLUNK_HEC_TOKEN
+        source: appsec_crew
+        sourcetype: _json

@@ -1,0 +1,79 @@
+# Bundled default — used when the scanned repository has no `appsec_crew.yaml`.
+# Same baseline as `appsec_crew.yaml.example`: Jira, webhook, and Splunk stay disabled.
+# Copy the example to `appsec_crew.yaml` to customize.
+#
+# CrewAI: each enabled agent needs `llm.api_key` or `llm.api_key_env`.
+
+global:
+  min_severity: high
+  github:
+    token_env: GITHUB_TOKEN
+
+agents:
+  secrets_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      base_url: null
+      temperature: 0
+    tools:
+      betterleaks:
+        binary: betterleaks
+        config_path: null
+
+  dependencies_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    tools:
+      osv_scanner:
+        binary: osv-scanner
+        config_path: null
+
+  code_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    tools:
+      semgrep:
+        binary: semgrep
+        config_path: null
+        extra_configs:
+          - auto
+          - p/security-audit
+          - p/python
+          - p/javascript
+          - p/typescript
+          - p/java
+          - p/go
+          - p/rust
+
+  reporter:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+    tools:
+      jira:
+        enabled: false
+        base_url: https://your-company.atlassian.net
+        project_key: SEC
+        issue_type: Task
+        email_env: JIRA_EMAIL
+        api_token_env: JIRA_API_TOKEN
+      webhook:
+        enabled: false
+        url_env: APPSEC_WEBHOOK_URL
+        url: ""
+        headers: {}
+        header_secrets: {}
+      splunk:
+        enabled: false
+        hec_url_env: SPLUNK_HEC_URL
+        hec_url: ""
+        token_env: SPLUNK_HEC_TOKEN
+        source: appsec_crew
+        sourcetype: _json

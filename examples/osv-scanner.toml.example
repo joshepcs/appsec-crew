@@ -1,0 +1,8 @@
+# Optional OSV-Scanner configuration in the repository root as `osv-scanner.toml`.
+# Schema depends on your installed OSV-Scanner major version — see:
+# https://google.github.io/osv-scanner/configuration/
+
+# Example (adjust for your scanner version):
+# IgnoredVulns = []
+# [[PackageOverrides]]
+# name = "example-package"

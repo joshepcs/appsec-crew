@@ -1,0 +1,94 @@
+# Reusable workflow: install Betterleaks, OSV-Scanner, Semgrep; run AppSec Crew on the caller checkout.
+name: AppSec Crew (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package_path:
+        type: string
+        description: Relative path from repo root to this package (directory with pyproject.toml)
+        required: true
+      scan_path:
+        type: string
+        description: Directory to scan (usually repository root ".")
+        default: "."
+      config_file:
+        type: string
+        description: >
+          Path to appsec_crew.yaml relative to repository root. Leave empty to auto-resolve:
+          use appsec_crew.yaml in scan_path if present, otherwise the bundled default
+          (reporter Jira/webhook/Splunk disabled).
+        default: ""
+      betterleaks_version:
+        type: string
+        description: Betterleaks release tag (e.g. v1.1.1)
+        default: v1.1.1
+      osv_scanner_version:
+        type: string
+        description: OSV-Scanner release tag
+        default: v1.9.1
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  appsec-crew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OSV-Scanner
+        env:
+          VERSION: ${{ inputs.osv_scanner_version }}
+        run: |
+          set -euxo pipefail
+          curl -sSL "https://github.com/google/osv-scanner/releases/download/${VERSION}/osv-scanner_linux_amd64" -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner --version
+
+      - name: Install Betterleaks
+        env:
+          VERSION: ${{ inputs.betterleaks_version }}
+        run: |
+          set -euxo pipefail
+          ver="${VERSION#v}"
+          curl -sSL "https://github.com/betterleaks/betterleaks/releases/download/${VERSION}/betterleaks_${ver}_linux_x64.tar.gz" -o /tmp/bl.tgz
+          tar -xzf /tmp/bl.tgz -C /tmp
+          install -m 0755 /tmp/betterleaks /usr/local/bin/betterleaks
+          betterleaks version
+
+      - name: Install Semgrep + AppSec Crew
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+          pip install "./${{ inputs.package_path }}"
+
+      - name: Run AppSec Crew
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          APPSEC_WEBHOOK_URL: ${{ secrets.APPSEC_WEBHOOK_URL }}
+          SPLUNK_HEC_URL: ${{ secrets.SPLUNK_HEC_URL }}
+          SPLUNK_HEC_TOKEN: ${{ secrets.SPLUNK_HEC_TOKEN }}
+          GIT_COMMITTER_NAME: appsec-crew
+          GIT_COMMITTER_EMAIL: appsec-crew@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.config_file }}" ]; then
+            appsec-crew --repo "${{ inputs.scan_path }}" --config "${{ inputs.config_file }}"
+          else
+            appsec-crew --repo "${{ inputs.scan_path }}"
+          fi

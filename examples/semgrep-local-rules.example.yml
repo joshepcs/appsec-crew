@@ -1,0 +1,12 @@
+# Optional: copy to `.semgrep.yml` in the repository root to add **org-specific** rules.
+# By default AppSec Crew does not require this file: it passes registry configs from
+# `agents.code_reviewer.tools.semgrep.extra_configs` in appsec_crew.yaml (e.g. auto + language packs).
+#
+# See: https://semgrep.dev/docs/writing-rules/overview/
+
+rules:
+  - id: example-no-eval
+    languages: [python]
+    message: Avoid eval()
+    pattern: eval(...)
+    severity: ERROR

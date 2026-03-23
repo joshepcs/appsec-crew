@@ -1,0 +1,32 @@
+name: Bug report
+description: Something is broken or behaves incorrectly
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect vs what occurred?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, command line, workflow snippet, or minimal config (no secrets).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: e.g. pip version, git SHA, or workflow ref
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, CI runner (optional)
