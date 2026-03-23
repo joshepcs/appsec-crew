@@ -19,6 +19,8 @@ pytest
    ```bash
    pip install -e ".[dev]"
    pytest -v
+   # optional coverage (requires pytest-cov, included in [dev]):
+   pytest -q --cov=appsec_crew --cov-report=term-missing
    ```
 
 2. **CLI smoke** — verifies the entrypoint and config resolution. With default/bundled config and no `OPENAI_API_KEY`, expect exit code **3** and a message about LLM keys:

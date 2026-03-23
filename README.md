@@ -103,6 +103,28 @@ If you **omit** `--config`:
 
 An explicit `--config /path` must point to an existing file.
 
+### Tool versions (per agent)
+
+Pin external scanners for **reproducible CI** and for the reporter summary under each tool block:
+
+```yaml
+agents:
+  secrets_reviewer:
+    tools:
+      betterleaks:
+        version: v1.1.1   # GitHub release tag
+  dependencies_reviewer:
+    tools:
+      osv_scanner:
+        version: v2.3.3   # GitHub release tag (google/osv-scanner)
+  code_reviewer:
+    tools:
+      semgrep:
+        version: "1.156.0"  # PyPI → pip install semgrep==…
+```
+
+Omit `version` and the runtime loads pins from the packaged [`bundled_appsec_crew.yaml`](./src/appsec_crew/bundled_appsec_crew.yaml) only (no duplicate defaults in Python). Locally, install matching versions yourself; the CLI does not download binaries. To print the resolved pins (e.g. debugging CI): `appsec-crew-print-tool-versions --repo /path/to/scanned/repo [--config path]`.
+
 ### GitHub Actions path (`…/work/repo/repo`)
 
 `GITHUB_WORKSPACE` is always `/home/runner/work/<repo-name>/<repo-name>`. The path is **not** duplicated by mistake: the first segment is the workflow “share”, the second is the clone directory ([GitHub Actions reference](https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables)).
@@ -113,11 +135,12 @@ An explicit `--config /path` must point to an existing file.
 - **Logging**: Each subprocess prints a line to **stderr**: `[appsec-crew] executing: {"tool":"…","argv":[…],"shell":"…"}` plus the same argv is stored in workflow JSON as `commands_executed`.
 - **False positives**: Optional **LLM triage** (`llm_triage: true` under each tool block) can dismiss likely false positives after scanning. **Default is off** so CI matches raw scanner output unless you opt in.
 - **Semgrep severity**: `global.min_severity` filters by rule severity. **`WARNING` counts like HIGH/ERROR** (rank 4) for the `high` threshold — Semgrep labels many real issues as WARNING. Missing / unknown severities default to HIGH. Explicit `INFO` / `LOW` / `MEDIUM` use the usual map.
+- **Semgrep registry packs**: Each `extra_configs` value is a Registry id (`p/...`). If any pack returns **404** or is invalid, Semgrep reports `errors` in the JSON and may scan **no files** (`paths.scanned` empty) — not a silent success. The bundled defaults use **`p/golang`** for Go rules (`p/go` no longer resolves on the registry).
 - **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted `--config …` tokens) and `{autofix}` (`--autofix ` or empty). Put a **space before `--json`** in custom Semgrep templates, e.g. `… {config_args} --json -o {report} {repo}`.
 
 ### CI: “0 Semgrep findings” vs `global.min_severity`
 
-The summary line **raw from scan** is the Semgrep JSON **before** `global.min_severity`; **after severity filter** is after that gate; **findings** is after LLM triage (if enabled). If **raw > 0** but counts after the severity line are **0**, relax `global.min_severity` (e.g. `high` → `medium`) or adjust rules — the scanner is working; the gate is policy. If **raw is 0** and you expected issues, check rules/registry access and that files are tracked (Semgrep uses `git` by default).
+The summary line **raw from scan** is the Semgrep JSON **before** `global.min_severity`; **after severity filter** is after that gate; **findings** is after LLM triage (if enabled). If **raw > 0** but counts after the severity line are **0**, relax `global.min_severity` (e.g. `high` → `medium`) or adjust rules — the scanner is working; the gate is policy. If **raw is 0** and you expected issues, inspect Semgrep’s JSON **`errors`** (registry 404s invalidate the whole config), network/registry access, and that files are tracked (Semgrep uses `git` by default).
 
 The reusable workflow runs `git config --global --add safe.directory '*'` so Git 2.35.2+ does not block the checkout and Semgrep sees tracked files ([Semgrep: git command errors](https://semgrep.dev/docs/kb/semgrep-ci/git-command-errors)). To change how targets are chosen (e.g. `--novcs`, `--no-git-ignore`, `--scan-unknown-extensions`), use `extra_args` or a custom `command` — see the [Semgrep CLI reference](https://semgrep.dev/docs/cli-reference).
 
@@ -166,7 +189,8 @@ This repo publishes:
 | `package_path`                                | When `install_from_github` is **false**: path from caller root to a folder with this package’s `pyproject.toml` (vendor/submodule). Default `.` (same repo as the workflow). |
 | `scan_path`                                   | Directory to scan (usually `.`)                                                                                         |
 | `config_file`                                 | Relative path to `appsec_crew.yaml`, or **empty** for [auto-resolution](#configuration-resolution)                      |
-| `betterleaks_version` / `osv_scanner_version` | Release tags for binaries                                                                                               |
+
+Scanner **versions** are **not** workflow inputs: they come from `agents.*.tools.*.version` in the resolved `appsec_crew.yaml` (see template). The job runs `python -m appsec_crew.ci_versions` before downloading Betterleaks / OSV-Scanner or pinning Semgrep.
 
 
 Use `secrets: inherit` (or map secrets) for `GITHUB_TOKEN`, `OPENAI_API_KEY`, and optional reporter secrets.

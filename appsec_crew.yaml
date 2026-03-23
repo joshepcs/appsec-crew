@@ -17,10 +17,14 @@
 # Scanner scope: by default the workspace is scanned recursively (Betterleaks `dir` on the repo tree,
 # OSV `scan -r`, Semgrep `scan` on the repo root). Stderr logs each invocation as JSON with full argv.
 #
+# Tool block (per agent): optional `version` pins the binary/Semgrep release for the reusable GitHub Actions
+# workflow (`agents.secrets_reviewer.tools.betterleaks.version`, `…osv_scanner.version`, `…semgrep.version`).
+# Omit `version` to use packaged defaults.
+#
 # Tool CLI overrides (per agent `tools` block):
-#   - betterleaks: `extra_args` (list), `command` (optional full template: {binary} {repo} {report} {config})
-#   - osv_scanner: `scan_extra_args`, `scan_command`, `fix_extra_args` (same placeholders + {config} on scan)
-#   - semgrep: `extra_args`, `command` — include a space before `--json`, e.g.
+#   - betterleaks: `version`, `extra_args` (list), `command` (optional full template: {binary} {repo} {report} {config})
+#   - osv_scanner: `version`, `scan_extra_args`, `scan_command`, `fix_extra_args` (same placeholders + {config} on scan)
+#   - semgrep: `version`, `extra_args`, `command` — include a space before `--json`, e.g.
 #     "{binary} scan {autofix}{config_args} --json -o {report} {repo}"
 #   - `llm_triage: false` under a tool disables the false-positive triage pass for that agent (default true).
 
@@ -43,6 +47,7 @@ agents:
     tools:
       betterleaks:
         binary: betterleaks
+        version: v1.1.1
         config_path: null
 
   dependencies_reviewer:
@@ -53,6 +58,7 @@ agents:
     tools:
       osv_scanner:
         binary: osv-scanner
+        version: v2.3.3
         config_path: null
 
   code_reviewer:
@@ -63,6 +69,7 @@ agents:
     tools:
       semgrep:
         binary: semgrep
+        version: "1.156.0"
         config_path: null
         extra_configs:
           - auto
@@ -71,7 +78,7 @@ agents:
           - p/javascript
           - p/typescript
           - p/java
-          - p/go
+          - p/golang
           - p/rust
 
   reporter:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -64,11 +65,73 @@ DEFAULT_SEMGREP_EXTRA_CONFIGS: tuple[str, ...] = (
     "p/javascript",
     "p/typescript",
     "p/java",
-    "p/go",
+    "p/golang",
     "p/rust",
 )
 
 VALID_MIN_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
+
+
+def _coerce_tool_version(value: Any, default: str) -> str:
+    if value is None:
+        return default
+    s = str(value).strip()
+    return s if s else default
+
+
+@dataclass(frozen=True)
+class ToolVersions:
+    """
+    Aggregated pins for CI / reporter (from per-tool ``version`` in YAML).
+
+    YAML paths: ``agents.secrets_reviewer.tools.betterleaks.version`` (GitHub tag),
+    ``agents.dependencies_reviewer.tools.osv_scanner.version`` (GitHub tag),
+    ``agents.code_reviewer.tools.semgrep.version`` (PyPI, for ``pip install semgrep==…``).
+    When those keys are omitted in the active config, values are taken from ``bundled_appsec_crew.yaml``
+    (see ``bundled_default_tool_versions``). The reusable workflow reads them via ``appsec-crew-print-tool-versions``.
+    """
+
+    betterleaks: str
+    osv_scanner: str
+    semgrep: str
+
+
+def _tool_versions_from_agents_block(agents: dict[str, Any]) -> ToolVersions:
+    bl = ((agents.get("secrets_reviewer") or {}).get("tools") or {}).get("betterleaks") or {}
+    osv = ((agents.get("dependencies_reviewer") or {}).get("tools") or {}).get("osv_scanner") or {}
+    sg = ((agents.get("code_reviewer") or {}).get("tools") or {}).get("semgrep") or {}
+
+    def pick(tool: dict[str, Any]) -> str:
+        x = tool.get("version")
+        if x is None:
+            return ""
+        return str(x).strip()
+
+    return ToolVersions(betterleaks=pick(bl), osv_scanner=pick(osv), semgrep=pick(sg))
+
+
+@lru_cache(maxsize=1)
+def bundled_default_tool_versions() -> ToolVersions:
+    """
+    Tool ``version`` pins from the packaged ``bundled_appsec_crew.yaml`` only — single source for defaults
+    when a repo omits ``version`` under a tool block or has no local ``appsec_crew.yaml``.
+    """
+    path = bundled_default_config_path()
+    if not path.is_file():
+        msg = f"Bundled default config missing: {path}"
+        raise FileNotFoundError(msg)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    agents = raw.get("agents") or {}
+    tv = _tool_versions_from_agents_block(agents)
+    for yaml_path, val in (
+        ("agents.secrets_reviewer.tools.betterleaks.version", tv.betterleaks),
+        ("agents.dependencies_reviewer.tools.osv_scanner.version", tv.osv_scanner),
+        ("agents.code_reviewer.tools.semgrep.version", tv.semgrep),
+    ):
+        if not val:
+            msg = f"{path} must define a non-empty {yaml_path!r}"
+            raise ValueError(msg)
+    return tv
 
 
 @dataclass
@@ -109,6 +172,7 @@ class SecretsReviewerSettings:
     enabled: bool = True
     llm: LlmAgentConfig = field(default_factory=LlmAgentConfig)
     betterleaks_binary: str = "betterleaks"
+    betterleaks_version: str = field(default_factory=lambda: bundled_default_tool_versions().betterleaks)
     betterleaks_config_path: str | None = None
     betterleaks_extra_args: list[str] = field(default_factory=list)
     betterleaks_command: str | None = None
@@ -120,6 +184,7 @@ class DependenciesReviewerSettings:
     enabled: bool = True
     llm: LlmAgentConfig = field(default_factory=LlmAgentConfig)
     osv_scanner_binary: str = "osv-scanner"
+    osv_scanner_version: str = field(default_factory=lambda: bundled_default_tool_versions().osv_scanner)
     osv_config_path: str | None = None
     osv_scan_extra_args: list[str] = field(default_factory=list)
     osv_scan_command: str | None = None
@@ -132,6 +197,7 @@ class CodeReviewerSettings:
     enabled: bool = True
     llm: LlmAgentConfig = field(default_factory=LlmAgentConfig)
     semgrep_binary: str = "semgrep"
+    semgrep_version: str = field(default_factory=lambda: bundled_default_tool_versions().semgrep)
     semgrep_config_path: str | None = None
     semgrep_extra_configs: list[str] = field(default_factory=list)
     semgrep_extra_args: list[str] = field(default_factory=list)
@@ -187,6 +253,7 @@ class AppSecSettings:
     dependencies_reviewer: DependenciesReviewerSettings
     code_reviewer: CodeReviewerSettings
     reporter: ReporterSettings
+    tool_versions: ToolVersions = field(default_factory=bundled_default_tool_versions)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def github_token(self) -> str | None:
@@ -229,7 +296,7 @@ def _str_list(val: Any) -> list[str]:
     return []
 
 
-def _load_secrets_reviewer(block: dict[str, Any]) -> SecretsReviewerSettings:
+def _load_secrets_reviewer(block: dict[str, Any], pin: ToolVersions) -> SecretsReviewerSettings:
     tools = block.get("tools") or {}
     bl = tools.get("betterleaks") or {}
     cmd = bl.get("command")
@@ -238,6 +305,7 @@ def _load_secrets_reviewer(block: dict[str, Any]) -> SecretsReviewerSettings:
         enabled=bool(block.get("enabled", True)),
         llm=_parse_llm(block.get("llm")),
         betterleaks_binary=str(bl.get("binary", "betterleaks")),
+        betterleaks_version=_coerce_tool_version(bl.get("version"), pin.betterleaks),
         betterleaks_config_path=bl.get("config_path"),
         betterleaks_extra_args=_str_list(bl.get("extra_args")),
         betterleaks_command=cmd_s,
@@ -245,7 +313,7 @@ def _load_secrets_reviewer(block: dict[str, Any]) -> SecretsReviewerSettings:
     )
 
 
-def _load_dependencies_reviewer(block: dict[str, Any]) -> DependenciesReviewerSettings:
+def _load_dependencies_reviewer(block: dict[str, Any], pin: ToolVersions) -> DependenciesReviewerSettings:
     tools = block.get("tools") or {}
     osv = tools.get("osv_scanner") or {}
     scan_cmd = osv.get("scan_command")
@@ -254,6 +322,7 @@ def _load_dependencies_reviewer(block: dict[str, Any]) -> DependenciesReviewerSe
         enabled=bool(block.get("enabled", True)),
         llm=_parse_llm(block.get("llm")),
         osv_scanner_binary=str(osv.get("binary", "osv-scanner")),
+        osv_scanner_version=_coerce_tool_version(osv.get("version"), pin.osv_scanner),
         osv_config_path=osv.get("config_path"),
         osv_scan_extra_args=_str_list(osv.get("scan_extra_args")),
         osv_scan_command=scan_cmd_s,
@@ -262,7 +331,7 @@ def _load_dependencies_reviewer(block: dict[str, Any]) -> DependenciesReviewerSe
     )
 
 
-def _load_code_reviewer(block: dict[str, Any]) -> CodeReviewerSettings:
+def _load_code_reviewer(block: dict[str, Any], pin: ToolVersions) -> CodeReviewerSettings:
     tools = block.get("tools") or {}
     sg = tools.get("semgrep") or {}
     raw_extras = sg.get("extra_configs")
@@ -276,6 +345,7 @@ def _load_code_reviewer(block: dict[str, Any]) -> CodeReviewerSettings:
         enabled=bool(block.get("enabled", True)),
         llm=_parse_llm(block.get("llm")),
         semgrep_binary=str(sg.get("binary", "semgrep")),
+        semgrep_version=_coerce_tool_version(sg.get("version"), pin.semgrep),
         semgrep_config_path=sg.get("config_path"),
         semgrep_extra_configs=extras,
         semgrep_extra_args=_str_list(sg.get("extra_args")),
@@ -350,13 +420,23 @@ def load_settings(path: Path) -> AppSecSettings:
     )
 
     agents_block = raw.get("agents") or {}
+    pin = bundled_default_tool_versions()
+    secrets_reviewer = _load_secrets_reviewer(agents_block.get("secrets_reviewer") or {}, pin)
+    dependencies_reviewer = _load_dependencies_reviewer(agents_block.get("dependencies_reviewer") or {}, pin)
+    code_reviewer = _load_code_reviewer(agents_block.get("code_reviewer") or {}, pin)
+    tool_versions = ToolVersions(
+        betterleaks=secrets_reviewer.betterleaks_version,
+        osv_scanner=dependencies_reviewer.osv_scanner_version,
+        semgrep=code_reviewer.semgrep_version,
+    )
 
     settings = AppSecSettings(
         global_settings=global_settings,
-        secrets_reviewer=_load_secrets_reviewer(agents_block.get("secrets_reviewer") or {}),
-        dependencies_reviewer=_load_dependencies_reviewer(agents_block.get("dependencies_reviewer") or {}),
-        code_reviewer=_load_code_reviewer(agents_block.get("code_reviewer") or {}),
+        secrets_reviewer=secrets_reviewer,
+        dependencies_reviewer=dependencies_reviewer,
+        code_reviewer=code_reviewer,
         reporter=_load_reporter(agents_block.get("reporter") or {}),
+        tool_versions=tool_versions,
         raw=raw,
     )
 

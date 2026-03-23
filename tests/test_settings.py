@@ -2,7 +2,7 @@ from pathlib import Path
 
 import yaml
 
-from appsec_crew.settings import load_settings
+from appsec_crew.settings import bundled_default_tool_versions, load_settings
 from appsec_crew.utils.llm import crew_llm_ready
 
 
@@ -58,6 +58,45 @@ def test_global_github_token_from_env(tmp_path: Path, monkeypatch) -> None:
     )
     s = load_settings(cfg)
     assert s.global_settings.github_token == "env-token"
+
+
+def test_tool_versions_defaults(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    cfg = tmp_path / "appsec_crew.yaml"
+    cfg.write_text(yaml.safe_dump({"global": {"github": {}}, "agents": _minimal_agents()}), encoding="utf-8")
+    s = load_settings(cfg)
+    assert s.tool_versions == bundled_default_tool_versions()
+
+
+def test_tool_version_empty_string_falls_back_to_bundle(tmp_path: Path, monkeypatch) -> None:
+    """Blank YAML ``version: ""`` should use pins from bundled default."""
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    agents = _minimal_agents()
+    agents["secrets_reviewer"]["tools"]["betterleaks"]["version"] = ""
+    cfg = tmp_path / "appsec_crew.yaml"
+    cfg.write_text(yaml.safe_dump({"global": {"github": {}}, "agents": agents}), encoding="utf-8")
+    s = load_settings(cfg)
+    assert s.secrets_reviewer.betterleaks_version == bundled_default_tool_versions().betterleaks
+
+
+def test_tool_versions_yaml_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    agents = _minimal_agents()
+    agents["secrets_reviewer"]["tools"]["betterleaks"]["version"] = "v1.0.0"
+    agents["dependencies_reviewer"]["tools"]["osv_scanner"]["version"] = "v1.9.1"
+    agents["code_reviewer"]["tools"]["semgrep"]["version"] = "1.99.0"
+    cfg = tmp_path / "appsec_crew.yaml"
+    cfg.write_text(
+        yaml.safe_dump({"global": {"github": {}}, "agents": agents}),
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.tool_versions.betterleaks == "v1.0.0"
+    assert s.tool_versions.osv_scanner == "v1.9.1"
+    assert s.tool_versions.semgrep == "1.99.0"
+    assert s.secrets_reviewer.betterleaks_version == "v1.0.0"
+    assert s.dependencies_reviewer.osv_scanner_version == "v1.9.1"
+    assert s.code_reviewer.semgrep_version == "1.99.0"
 
 
 def test_min_severity_default_high(tmp_path: Path, monkeypatch) -> None:

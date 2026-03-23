@@ -14,10 +14,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
 ]
 
 [project.scripts]
 appsec-crew = "appsec_crew.main:main"
+appsec-crew-print-tool-versions = "appsec_crew.ci_versions:main"
 
 [project.urls]
 Homepage = "https://github.com/celagus/appsec-crew"

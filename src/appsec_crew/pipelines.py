@@ -441,6 +441,11 @@ def _markdown_report(ctx: RuntimeContext) -> str:
         f"- **Minimum severity (global)**: **{min_s}**",
         f"- **UTC time**: {datetime.now(timezone.utc).isoformat()}",
         "",
+        "- **Tool versions (config)**: "
+        f"Betterleaks `{ctx.settings.tool_versions.betterleaks}`, "
+        f"OSV-Scanner `{ctx.settings.tool_versions.osv_scanner}`, "
+        f"Semgrep `{ctx.settings.tool_versions.semgrep}`",
+        "",
         "Scans target the **checked-out repository workspace** recursively by default "
         "(Betterleaks `dir` over the tree, OSV `-r`, Semgrep `scan` on the repo root).",
         "",

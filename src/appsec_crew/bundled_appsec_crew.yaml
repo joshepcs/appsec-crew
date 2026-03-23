@@ -20,6 +20,7 @@ agents:
     tools:
       betterleaks:
         binary: betterleaks
+        version: v1.1.1
         config_path: null
         # extra_args: []          # appended to default CLI
         # command: null          # or full template: "{binary} dir --no-banner -f json -r {report} {repo}"
@@ -33,6 +34,7 @@ agents:
     tools:
       osv_scanner:
         binary: osv-scanner
+        version: v2.3.3
         config_path: null
         # scan_extra_args: []
         # scan_command: null     # "{binary} scan -r -f json --output {report} {repo}" pattern if overriding
@@ -47,6 +49,7 @@ agents:
     tools:
       semgrep:
         binary: semgrep
+        version: "1.156.0"
         config_path: null
         # extra_args: []
         # command: null          # "{binary} scan {autofix}{config_args} --json -o {report} {repo}"
@@ -58,7 +61,7 @@ agents:
           - p/javascript
           - p/typescript
           - p/java
-          - p/go
+          - p/golang
           - p/rust
 
   reporter:
