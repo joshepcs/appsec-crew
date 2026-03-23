@@ -13,6 +13,15 @@
 #   - Betterleaks / Gitleaks: `.betterleaks.toml` or `.gitleaks.toml`
 #   - OSV-Scanner: `osv-scanner.toml` (see examples/osv-scanner.toml.example)
 #   - Semgrep: `.semgrep.yml` (see examples/semgrep-local-rules.example.yml)
+#
+# Scanner scope: by default the workspace is scanned recursively (Betterleaks `dir` on the repo tree,
+# OSV `scan -r`, Semgrep `scan` on the repo root). Stderr logs each invocation as JSON with full argv.
+#
+# Tool CLI overrides (per agent `tools` block):
+#   - betterleaks: `extra_args` (list), `command` (optional full template: {binary} {repo} {report} {config})
+#   - osv_scanner: `scan_extra_args`, `scan_command`, `fix_extra_args` (same placeholders + {config} on scan)
+#   - semgrep: `extra_args`, `command` with {binary} {repo} {report} {config_args} {autofix} ({autofix} is "--autofix " or "")
+#   - `llm_triage: false` under a tool disables the false-positive triage pass for that agent (default true).
 
 global:
   # Minimum severity for dependency (CVSS) and Semgrep findings.

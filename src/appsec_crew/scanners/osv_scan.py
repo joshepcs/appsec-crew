@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -129,7 +130,7 @@ def run_osv_fix_inplace(
     *,
     extra_args: list[str] | None = None,
     commands_log: list[str] | None = None,
-) -> Any:
+) -> subprocess.CompletedProcess[str]:
     cmd = [
         binary,
         "fix",
@@ -152,7 +153,7 @@ def run_osv_fix_override_pom(
     *,
     extra_args: list[str] | None = None,
     commands_log: list[str] | None = None,
-) -> Any:
+) -> subprocess.CompletedProcess[str]:
     cmd = [
         binary,
         "fix",

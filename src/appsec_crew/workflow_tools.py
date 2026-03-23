@@ -16,8 +16,9 @@ from appsec_crew.runtime import get_ctx
 class SecretsReviewerTool(BaseTool):
     name: str = "secrets_reviewer_workflow"
     description: str = (
-        "Runs Betterleaks on the repository, applies configured exceptions, "
-        "and opens one GitHub issue per remaining secret finding. Call once."
+        "Runs Betterleaks recursively over the repo workspace, logs the exact CLI to stderr, "
+        "LLM-triages likely false positives, then opens one GitHub issue per remaining finding. "
+        "Returns JSON with commands_executed and dismissed_findings. Call once."
     )
 
     def _run(self) -> str:
@@ -27,8 +28,9 @@ class SecretsReviewerTool(BaseTool):
 class DependenciesReviewerTool(BaseTool):
     name: str = "dependencies_reviewer_workflow"
     description: str = (
-        "Runs OSV-Scanner, filters HIGH/CRITICAL (CVSS), applies osv-scanner fix where supported, "
-        "and opens a single dependency remediation PR. Call once."
+        "Runs OSV-Scanner recursively on the repo (-r), logs argv (scan + fix), filters by min CVSS, "
+        "LLM-triages likely false-positive rows, applies osv-scanner fix where supported, opens one PR. "
+        "Returns JSON with commands_executed and dismissed_findings. Call once."
     )
 
     def _run(self) -> str:
@@ -38,8 +40,9 @@ class DependenciesReviewerTool(BaseTool):
 class CodeReviewerTool(BaseTool):
     name: str = "code_reviewer_workflow"
     description: str = (
-        "Detects the dominant source language, runs Semgrep with repo + registry configs, "
-        "filters HIGH/CRITICAL findings, applies Semgrep autofix, and opens a PR describing rationale. Call once."
+        "Detects the dominant source language, runs Semgrep scan on the repo tree (recursive), logs argv, "
+        "filters by min severity, LLM-triages false positives, applies autofix, opens a PR. "
+        "Returns JSON with commands_executed and dismissed_findings. Call once."
     )
 
     def _run(self) -> str:
@@ -49,8 +52,8 @@ class CodeReviewerTool(BaseTool):
 class ReporterTool(BaseTool):
     name: str = "reporter_workflow"
     description: str = (
-        "Summarizes prior workflows, optionally comments on the current PR, "
-        "upserts the Jira tracking ticket, POSTs the webhook JSON, and sends Splunk HEC. Call once."
+        "Builds Markdown including executed scanner commands and dismissed/triaged findings from prior steps; "
+        "optionally comments on the PR, upserts Jira, POSTs webhook (with dismissed_counts), and Splunk HEC. Call once."
     )
 
     def _run(self) -> str:

@@ -85,6 +85,26 @@ def test_reporter_jira_nested_under_tools(tmp_path: Path, monkeypatch) -> None:
     assert s.reporter.jira.project_key == "SEC"
 
 
+def test_tool_cli_overrides_parse(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    agents = _minimal_agents()
+    agents["secrets_reviewer"]["tools"]["betterleaks"]["extra_args"] = ["--verbose"]
+    agents["secrets_reviewer"]["tools"]["betterleaks"]["command"] = ""
+    agents["dependencies_reviewer"]["tools"]["osv_scanner"]["scan_extra_args"] = ["--recursive"]
+    agents["dependencies_reviewer"]["tools"]["osv_scanner"]["fix_extra_args"] = ["--dry-run"]
+    agents["code_reviewer"]["tools"]["semgrep"]["extra_args"] = ["--timeout", "0"]
+    agents["code_reviewer"]["tools"]["semgrep"]["llm_triage"] = False
+    cfg = tmp_path / "appsec_crew.yaml"
+    cfg.write_text(yaml.safe_dump({"global": {"github": {}}, "agents": agents}), encoding="utf-8")
+    s = load_settings(cfg)
+    assert s.secrets_reviewer.betterleaks_extra_args == ["--verbose"]
+    assert s.secrets_reviewer.betterleaks_command is None
+    assert s.dependencies_reviewer.osv_scan_extra_args == ["--recursive"]
+    assert s.dependencies_reviewer.osv_fix_extra_args == ["--dry-run"]
+    assert s.code_reviewer.semgrep_extra_args == ["--timeout", "0"]
+    assert s.code_reviewer.llm_triage_findings is False
+
+
 def test_llm_yaml_schema_same_for_all_agents(tmp_path: Path, monkeypatch) -> None:
     """Every agent block uses _parse_llm + LlmAgentConfig; fields must match across roles."""
     monkeypatch.setenv("GITHUB_TOKEN", "t")
@@ -112,7 +132,7 @@ def test_llm_yaml_schema_same_for_all_agents(tmp_path: Path, monkeypatch) -> Non
 
 def test_crew_llm_ready_respects_disabled_agents(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    cfg = Path(__file__).resolve().parent.parent / "appsec_crew.yaml.example"
+    cfg = Path(__file__).resolve().parent.parent / "appsec_crew.yaml"
     s = load_settings(cfg)
     for block in (s.secrets_reviewer, s.dependencies_reviewer, s.code_reviewer, s.reporter):
         block.enabled = False

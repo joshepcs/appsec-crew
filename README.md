@@ -86,7 +86,7 @@ Never commit secrets. Use **GitHub Actions secrets** and optional YAML overrides
 │   ├── scanners/
 │   └── utils/                 # severity, filters, llm helpers
 ├── tests/
-├── appsec_crew.yaml.example
+├── appsec_crew.yaml
 ├── pyproject.toml
 └── README.md
 ```
@@ -102,6 +102,13 @@ If you **omit** `--config`:
 3. Packaged `**bundled_appsec_crew.yaml`** (reporter Jira / webhook / Splunk **off**)
 
 An explicit `--config /path` must point to an existing file.
+
+### Scanner workspace, logging, triage, and CLI overrides
+
+- **Scope**: Betterleaks runs `dir` on the repository root (full tree), OSV uses `scan -r`, Semgrep uses `scan` on the repo path (recursive by default).
+- **Logging**: Each subprocess prints a line to **stderr**: `[appsec-crew] executing: {"tool":"…","argv":[…],"shell":"…"}` plus the same argv is stored in workflow JSON as `commands_executed`.
+- **False positives**: After native filters (e.g. `.betterleaks.toml`, `osv-scanner.toml`, severity floors), an optional **LLM triage** pass (same model/keys as the agent) can dismiss likely false positives. Set `llm_triage: false` under `tools.betterleaks`, `tools.osv_scanner`, or `tools.semgrep` to skip it.
+- **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted bundle of `--config …`) and `{autofix}` (`--autofix ` or empty). See comments in `appsec_crew.yaml` / `bundled_appsec_crew.yaml`.
 
 ---
 
@@ -122,7 +129,7 @@ appsec-crew --repo /path/to/repo-to-scan
 # appsec-crew --repo /path/to/repo --config /path/to/appsec_crew.yaml
 ```
 
-Copy `[appsec_crew.yaml.example](./appsec_crew.yaml.example)` into the **target** repo as `appsec_crew.yaml` when you want a custom policy.
+Copy [`appsec_crew.yaml`](./appsec_crew.yaml) into the **target** repo when you want a custom policy.
 
 ---
 
