@@ -359,6 +359,7 @@ def run_code_pipeline(ctx: RuntimeContext) -> str:
         command_template=cr.semgrep_command,
         commands_log=commands,
     )
+    before_min_severity = len(findings)
     findings = filter_semgrep_by_min_severity(findings, min_lvl)
     after_filter = len(findings)
     findings, dismissed_raw = _triage_semgrep_findings(cr, findings)
@@ -366,6 +367,7 @@ def run_code_pipeline(ctx: RuntimeContext) -> str:
     ctx.state["code_reviewer"] = {
         "primary_language": lang,
         "findings": len(findings),
+        "semgrep_findings_before_min_severity": before_min_severity,
         "scanner_findings_after_severity": after_filter,
         "dismissed_findings": dismissed_pub,
         "commands_executed": commands,
@@ -490,7 +492,8 @@ def _markdown_report(ctx: RuntimeContext) -> str:
     lines.append(f"- Primary language: `{cr.get('primary_language', '?')}`")
     lines.append(
         f"- Semgrep findings (after min severity + triage): **{cr.get('findings', 'n/a')}** "
-        f"(pre-triage: **{cr.get('scanner_findings_after_severity', 'n/a')}**)"
+        f"(after severity filter, pre-triage: **{cr.get('scanner_findings_after_severity', 'n/a')}**; "
+        f"raw from scan: **{cr.get('semgrep_findings_before_min_severity', 'n/a')}**)"
     )
     if cr.get("pr_url"):
         lines.append(f"- PR: {cr['pr_url']}")

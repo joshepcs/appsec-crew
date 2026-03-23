@@ -22,3 +22,16 @@ def test_filter_semgrep_high_excludes_medium() -> None:
     ]
     out = filter_semgrep_by_min_severity(findings, "high")
     assert len(out) == 2
+
+
+def test_filter_semgrep_high_keeps_missing_severity() -> None:
+    """Registry rules often omit severity; they must not be dropped at min_severity high."""
+    findings = [
+        {"extra": {"message": "no severity field"}},
+        {"extra": {"severity": "INFO"}},
+        {"extra": {"severity": "HIGH"}},
+    ]
+    out = filter_semgrep_by_min_severity(findings, "high")
+    assert len(out) == 2
+    assert out[0]["extra"]["message"] == "no severity field"
+    assert out[1]["extra"]["severity"] == "HIGH"

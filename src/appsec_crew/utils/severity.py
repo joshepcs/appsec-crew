@@ -41,12 +41,24 @@ _MIN_SEVERITY_SEMGREP_RANK: dict[str, int] = {
 
 
 def semgrep_finding_rank(finding: dict) -> int:
-    extra = finding.get("extra") or {}
-    sev = (extra.get("severity") or "").upper()
-    meta = extra.get("metadata") or {}
-    if meta.get("severity"):
-        sev = str(meta["severity"]).upper()
-    return _SEMGREP_RANK.get(sev, 2)
+    """
+    Map Semgrep JSON finding to a numeric rank.
+
+    Registry rules often omit ``extra.severity``; those used to default to WARNING (rank 2) and were then
+    dropped when ``global.min_severity`` was ``high`` (needs rank ≥ 4). Missing severity is treated as **HIGH**
+    so unlabeled findings are still actionable at the ``high`` threshold; explicit ``INFO`` / ``LOW`` stay low.
+    """
+    raw_ex = finding.get("extra")
+    extra = raw_ex if isinstance(raw_ex, dict) else {}
+    meta = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+    sev = (extra.get("severity") or "").strip().upper()
+    if not sev and meta.get("severity") is not None:
+        sev = str(meta["severity"]).strip().upper()
+    if not sev and finding.get("severity") is not None:
+        sev = str(finding["severity"]).strip().upper()
+    if not sev:
+        return _SEMGREP_RANK["HIGH"]
+    return _SEMGREP_RANK.get(sev, _SEMGREP_RANK["WARNING"])
 
 
 def min_rank_for_semgrep(level: str) -> int:
