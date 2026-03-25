@@ -4,7 +4,9 @@
 # in a reusable workflow resolves against the **caller** workspace, so the composite cannot live at `./.github/...`
 # until that tree exists under $GITHUB_WORKSPACE.
 #
-# Ref for the clone: suffix of github.workflow_ref after `@` (same as caller’s `uses: …@ref`), else github.workflow_sha.
+# Ref for the clone: suffix of github.workflow_ref after `@` when it exists on celagus/appsec-crew.
+# On caller `pull_request` events, workflow_ref often ends in `refs/pull/N/merge` (caller-only) — then use
+# github.workflow_sha (commit GitHub resolved for this reusable workflow on celagus/appsec-crew).
 #
 # Optional `github_environment`: secrets only on a GitHub Environment (callers cannot set `environment:` on `uses:`).
 name: AppSec Crew (reusable)
@@ -45,19 +47,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Keep in sync with appsec_crew.resolve_crew_checkout_ref (pytest: tests/test_resolve_crew_checkout_ref.py)
           wf_ref="${{ github.workflow_ref }}"
           ref="${wf_ref#*@}"
-          if [ -z "${ref}" ]; then
-            ref="${{ github.workflow_sha }}"
-          fi
+          # refs/pull/* exist only on the caller repo, not on celagus/appsec-crew
+          case "${ref}" in
+            refs/pull/*|"")
+              ref="${{ github.workflow_sha }}"
+              ;;
+          esac
           if [ -z "${ref}" ]; then
             echo "::error::Could not resolve ref for celagus/appsec-crew checkout"
             exit 1
           fi
+          echo "celagus/appsec-crew checkout ref=${ref}" >&2
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout celagus/appsec-crew (composite + pip install)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: celagus/appsec-crew
           ref: ${{ steps.crew_ref.outputs.ref }}
@@ -87,19 +94,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Keep in sync with appsec_crew.resolve_crew_checkout_ref (pytest: tests/test_resolve_crew_checkout_ref.py)
           wf_ref="${{ github.workflow_ref }}"
           ref="${wf_ref#*@}"
-          if [ -z "${ref}" ]; then
-            ref="${{ github.workflow_sha }}"
-          fi
+          case "${ref}" in
+            refs/pull/*|"")
+              ref="${{ github.workflow_sha }}"
+              ;;
+          esac
           if [ -z "${ref}" ]; then
             echo "::error::Could not resolve ref for celagus/appsec-crew checkout"
             exit 1
           fi
+          echo "celagus/appsec-crew checkout ref=${ref}" >&2
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout celagus/appsec-crew (composite + pip install)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: celagus/appsec-crew
           ref: ${{ steps.crew_ref.outputs.ref }}

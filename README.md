@@ -203,7 +203,7 @@ This repo publishes:
 | `config_file`                                 | Relative path to `appsec_crew.yaml`, or **empty** for [auto-resolution](#configuration-resolution)                      |
 | `github_environment`                          | Optional **GitHub Environment** name applied to the job **inside** this reusable workflow. Use when `OPENAI_API_KEY` (and other secrets) are defined only on that environment — you **cannot** set `environment:` on the caller’s `uses:` job. Leave empty (default) for repository/org secrets only. |
 
-The reusable workflow **always** clones **`celagus/appsec-crew`** using the ref from **`github.workflow_ref`** (the part after `@`), which matches the caller’s `uses: …/appsec-crew-reusable.yml@branch`, `@tag`, or `@sha` — no duplicate `appsec_crew_ref` input. If that were ever empty, the composite falls back to **`github.workflow_sha`**. Same-repo dogfood with `uses: ./.github/workflows/appsec-crew-reusable.yml` uses the current repository commit.
+The reusable workflow **always** clones **`celagus/appsec-crew`** using the ref from **`github.workflow_ref`** (the part after `@`) when it is valid on that repo. On **`pull_request`**, `workflow_ref` often ends in **`refs/pull/N/merge`**, which exists only on the caller — the bootstrap then uses **`github.workflow_sha`** (the commit GitHub resolved for the reusable workflow on `celagus/appsec-crew`). Same-repo dogfood with `uses: ./.github/workflows/appsec-crew-reusable.yml` uses the current repository commit.
 
 Scanner **versions** are **not** workflow inputs: they come from `agents.*.tools.*.version` in the resolved `appsec_crew.yaml` (see template). The job runs `python -m appsec_crew.ci_versions` before downloading Betterleaks / OSV-Scanner or pinning Semgrep.
 
