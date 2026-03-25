@@ -15,7 +15,6 @@ jobs:
   crew:
     uses: ./.github/workflows/appsec-crew-reusable.yml
     with:
-      package_path: .
       scan_path: .
       config_file: ""
     secrets: inherit

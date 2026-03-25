@@ -79,6 +79,7 @@ Never commit secrets. Use **GitHub Actions secrets** and optional YAML overrides
 ```
 ├── assets/                    # Branding (ASCII banner, optional png mark)
 ├── examples/                  # `osv-scanner.toml.example`, `semgrep-local-rules.example.yml` (see [below](#example-configuration-and-tool-files))
+├── .github/actions/           # `appsec-crew-steps` composite (reusable workflow)
 ├── src/appsec_crew/           # Package source
 │   ├── bundled_appsec_crew.yaml
 │   ├── config/                # Crew agent & task YAML
@@ -190,7 +191,7 @@ This repo publishes:
 | -------------------------------------------------------------------------- | ------------------------------------------------------- |
 | `[ci.yml](./.github/workflows/ci.yml)`                                     | `pytest` on push / PR                                   |
 | `[appsec-crew-reusable.yml](./.github/workflows/appsec-crew-reusable.yml)` | **Reusable** — install scanners + run `appsec-crew`     |
-| `[run-reusable.yml](./.github/workflows/run-reusable.yml)`                 | Dogfood: calls the reusable workflow with `package_path: .` |
+| `[run-reusable.yml](./.github/workflows/run-reusable.yml)`                 | Dogfood: calls the reusable workflow from the same repo (local `uses:`) |
 
 
 ### Reusable workflow inputs
@@ -198,20 +199,19 @@ This repo publishes:
 
 | Input                                         | Description                                                                                                             |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `install_from_github`                         | If **true**, clone `appsec_crew_repository` at `appsec_crew_ref` and `pip install` from there (typical for app repos that do not vendor this package). |
-| `appsec_crew_repository` / `appsec_crew_ref`    | Used when `install_from_github` is true (default repo `celagus/appsec-crew`, ref `main`).                               |
-| `package_path`                                | When `install_from_github` is **false**: path from caller root to a folder with this package’s `pyproject.toml` (vendor/submodule). Default `.` (same repo as the workflow). |
 | `scan_path`                                   | Directory to scan (usually `.`)                                                                                         |
 | `config_file`                                 | Relative path to `appsec_crew.yaml`, or **empty** for [auto-resolution](#configuration-resolution)                      |
+| `github_environment`                          | Optional **GitHub Environment** name applied to the job **inside** this reusable workflow. Use when `OPENAI_API_KEY` (and other secrets) are defined only on that environment — you **cannot** set `environment:` on the caller’s `uses:` job. Leave empty (default) for repository/org secrets only. |
+
+The reusable workflow **always** clones **`celagus/appsec-crew`** using the ref from **`github.workflow_ref`** (the part after `@`), which matches the caller’s `uses: …/appsec-crew-reusable.yml@branch`, `@tag`, or `@sha` — no duplicate `appsec_crew_ref` input. If that were ever empty, the composite falls back to **`github.workflow_sha`**. Same-repo dogfood with `uses: ./.github/workflows/appsec-crew-reusable.yml` uses the current repository commit.
 
 Scanner **versions** are **not** workflow inputs: they come from `agents.*.tools.*.version` in the resolved `appsec_crew.yaml` (see template). The job runs `python -m appsec_crew.ci_versions` before downloading Betterleaks / OSV-Scanner or pinning Semgrep.
 
+Shared steps live under [`.github/actions/appsec-crew-steps`](./.github/actions/appsec-crew-steps/action.yml) so the workflow can run the same steps with or without a GitHub Environment.
 
-Use `secrets: inherit` (or map secrets) for `GITHUB_TOKEN`, `OPENAI_API_KEY`, and optional reporter secrets.
+Use `secrets: inherit` (or map secrets) for `GITHUB_TOKEN`, `OPENAI_API_KEY`, and optional reporter secrets. With `github_environment` set, those names are resolved from the **environment** as well as the repo/org.
 
-### Example — pull request (install from GitHub; no vendored copy)
-
-Most application repos should install the package from this repository:
+### Example — pull request
 
 ```yaml
 name: AppSec Crew
@@ -229,29 +229,12 @@ jobs:
   scan:
     uses: celagus/appsec-crew/.github/workflows/appsec-crew-reusable.yml@v1
     with:
-      install_from_github: true
-      appsec_crew_ref: main
       scan_path: .
       config_file: ""
     secrets: inherit
 ```
 
-Pin `uses: ...@v1` (or a **commit SHA**) to a revision you trust; match `appsec_crew_ref` to that line if you need an exact pairing.
-
-### Example — pull request (vendored package in monorepo)
-
-If you copy or submodule this repo under e.g. `third_party/appsec-crew`:
-
-```yaml
-jobs:
-  scan:
-    uses: celagus/appsec-crew/.github/workflows/appsec-crew-reusable.yml@v1
-    with:
-      package_path: third_party/appsec-crew
-      scan_path: .
-      config_file: ""
-    secrets: inherit
-```
+Pin `uses: ...@v1` (or a **commit SHA**) to a revision you trust; the checkout of `celagus/appsec-crew` for `pip install` follows that same `@ref` (via `github.workflow_ref`).
 
 ### Example — scheduled scan (default branch)
 
@@ -272,8 +255,6 @@ jobs:
   scan:
     uses: celagus/appsec-crew/.github/workflows/appsec-crew-reusable.yml@v1
     with:
-      install_from_github: true
-      appsec_crew_ref: main
       scan_path: .
       config_file: ""
     secrets: inherit
