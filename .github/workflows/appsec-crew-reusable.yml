@@ -1,9 +1,12 @@
 # Reusable workflow: install Betterleaks, OSV-Scanner, Semgrep; run AppSec Crew on the caller checkout.
-# Always clones **celagus/appsec-crew** at the ref parsed from **github.workflow_ref** (suffix after `@`), i.e.
-# the same branch/tag/SHA the caller selected on `uses: …/appsec-crew-reusable.yml@ref`.
 #
-# Optional `github_environment`: when secrets live only on a GitHub Environment, pass its name here (callers
-# cannot set `environment:` on a `uses:` job). Steps: `.github/actions/appsec-crew-steps`.
+# Bootstrap: checkout celagus/appsec-crew into `.appsec-crew-checkout` first. A relative `uses: ./.github/actions/…`
+# in a reusable workflow resolves against the **caller** workspace, so the composite cannot live at `./.github/...`
+# until that tree exists under $GITHUB_WORKSPACE.
+#
+# Ref for the clone: suffix of github.workflow_ref after `@` (same as caller’s `uses: …@ref`), else github.workflow_sha.
+#
+# Optional `github_environment`: secrets only on a GitHub Environment (callers cannot set `environment:` on `uses:`).
 name: AppSec Crew (reusable)
 
 on:
@@ -37,7 +40,31 @@ jobs:
     if: ${{ inputs.github_environment == '' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/appsec-crew-steps
+      - name: Resolve celagus/appsec-crew ref
+        id: crew_ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          wf_ref="${{ github.workflow_ref }}"
+          ref="${wf_ref#*@}"
+          if [ -z "${ref}" ]; then
+            ref="${{ github.workflow_sha }}"
+          fi
+          if [ -z "${ref}" ]; then
+            echo "::error::Could not resolve ref for celagus/appsec-crew checkout"
+            exit 1
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout celagus/appsec-crew (composite + pip install)
+        uses: actions/checkout@v4
+        with:
+          repository: celagus/appsec-crew
+          ref: ${{ steps.crew_ref.outputs.ref }}
+          path: .appsec-crew-checkout
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.appsec-crew-checkout/.github/actions/appsec-crew-steps
         with:
           scan_path: ${{ inputs.scan_path }}
           config_file: ${{ inputs.config_file }}
@@ -55,7 +82,31 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.github_environment }}
     steps:
-      - uses: ./.github/actions/appsec-crew-steps
+      - name: Resolve celagus/appsec-crew ref
+        id: crew_ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          wf_ref="${{ github.workflow_ref }}"
+          ref="${wf_ref#*@}"
+          if [ -z "${ref}" ]; then
+            ref="${{ github.workflow_sha }}"
+          fi
+          if [ -z "${ref}" ]; then
+            echo "::error::Could not resolve ref for celagus/appsec-crew checkout"
+            exit 1
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout celagus/appsec-crew (composite + pip install)
+        uses: actions/checkout@v4
+        with:
+          repository: celagus/appsec-crew
+          ref: ${{ steps.crew_ref.outputs.ref }}
+          path: .appsec-crew-checkout
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ./.appsec-crew-checkout/.github/actions/appsec-crew-steps
         with:
           scan_path: ${{ inputs.scan_path }}
           config_file: ${{ inputs.config_file }}

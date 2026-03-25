@@ -207,7 +207,7 @@ The reusable workflow **always** clones **`celagus/appsec-crew`** using the ref 
 
 Scanner **versions** are **not** workflow inputs: they come from `agents.*.tools.*.version` in the resolved `appsec_crew.yaml` (see template). The job runs `python -m appsec_crew.ci_versions` before downloading Betterleaks / OSV-Scanner or pinning Semgrep.
 
-Shared steps live under [`.github/actions/appsec-crew-steps`](./.github/actions/appsec-crew-steps/action.yml) so the workflow can run the same steps with or without a GitHub Environment.
+Shared steps live under [`.github/actions/appsec-crew-steps`](./.github/actions/appsec-crew-steps/action.yml). The reusable workflow **first** checks out `celagus/appsec-crew` into `.appsec-crew-checkout`, then runs `uses: ./.appsec-crew-checkout/.github/actions/appsec-crew-steps` — a plain `./.github/actions/…` path would wrongly resolve on the **caller** repo (e.g. `sec-patecatl`), where that folder does not exist.
 
 Use `secrets: inherit` (or map secrets) for `GITHUB_TOKEN`, `OPENAI_API_KEY`, and optional reporter secrets. With `github_environment` set, those names are resolved from the **environment** as well as the repo/org.
 

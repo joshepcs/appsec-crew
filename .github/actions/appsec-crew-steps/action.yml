@@ -1,9 +1,10 @@
-# Shared install + run steps for appsec-crew-reusable.yml (avoids duplicating steps across jobs).
-# Clones celagus/appsec-crew using the ref suffix of github.workflow_ref (path@refs/heads/…, @tag, or @sha)
-# for this reusable workflow — i.e. the same @ref the caller put on `uses: …/appsec-crew-reusable.yml@ref`.
-# Falls back to github.workflow_sha if parsing yields nothing.
+# Shared steps for appsec-crew-reusable.yml.
+#
+# The reusable workflow must run `actions/checkout` of celagus/appsec-crew into `.appsec-crew-checkout`
+# *before* this composite (so `./.github/actions/...` resolves on the caller workspace, not inside crew).
+# This action only checks out the caller repo and runs install + appsec-crew.
 name: AppSec Crew steps
-description: Checkout, install scanners, run AppSec Crew on the caller workspace
+description: Checkout caller, install scanners, run AppSec Crew (crew repo already at .appsec-crew-checkout)
 
 inputs:
   scan_path:
@@ -11,7 +12,7 @@ inputs:
   config_file:
     required: true
   github_token:
-    description: Passed to checkout (private crew repo) and appsec-crew (GitHub API)
+    description: Passed to appsec-crew (GitHub API)
     required: true
   github_repository:
     required: true
@@ -37,34 +38,10 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Resolve celagus/appsec-crew ref from reusable workflow
-      id: crew_ref
-      shell: bash
-      run: |
-        set -euo pipefail
-        wf_ref="${{ github.workflow_ref }}"
-        ref="${wf_ref#*@}"
-        if [ -z "${ref}" ]; then
-          ref="${{ github.workflow_sha }}"
-        fi
-        if [ -z "${ref}" ]; then
-          echo "::error::Empty ref after github.workflow_ref/github.workflow_sha"
-          exit 1
-        fi
-        echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
-
     - name: Checkout caller repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-
-    - name: Checkout celagus/appsec-crew (same @ref as this reusable workflow)
-      uses: actions/checkout@v4
-      with:
-        repository: celagus/appsec-crew
-        ref: ${{ steps.crew_ref.outputs.ref }}
-        path: .appsec-crew-checkout
-        token: ${{ inputs.github_token }}
 
     - name: Git safe.directory (Semgrep / git-aware tools)
       shell: bash
@@ -86,7 +63,7 @@ runs:
         pip install --disable-pip-version-check 'pyyaml>=6'
         CREW_SRC="${GITHUB_WORKSPACE}/.appsec-crew-checkout/src"
         if [ ! -d "${CREW_SRC}/appsec_crew" ]; then
-          echo "::error::Expected appsec_crew under ${CREW_SRC} after checkout."
+          echo "::error::Expected .appsec-crew-checkout from the reusable workflow bootstrap; missing ${CREW_SRC}/appsec_crew"
           exit 1
         fi
         export PYTHONPATH="${CREW_SRC}"
