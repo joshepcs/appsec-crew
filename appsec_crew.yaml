@@ -1,18 +1,28 @@
-# AppSec Crew — configuration template.
+# AppSec Crew — configuration template (copy into the root of the repository you scan).
 #
-# Usage:
-#   - Copy to `appsec_crew.yaml` at the root of the repository you scan and customize it.
-#   - If `appsec_crew.yaml` is missing, the CLI loads the packaged `bundled_appsec_crew.yaml`
-#     (same baseline): reporter integrations (Jira, webhook, Splunk) stay disabled.
+# This file lives in the appsec-crew repo as the canonical example. Consumers should copy it to
+# `<your-repo>/appsec_crew.yaml`. If that file is missing, the CLI uses the packaged
+# `src/appsec_crew/bundled_appsec_crew.yaml` (same shape; Jira / webhook / Splunk off by default).
 #
 # Precedence: non-empty YAML values override environment variables for secrets.
 #
 # CrewAI: every enabled agent needs `llm.api_key` or `llm.api_key_env`.
 #
-# Exceptions / allowlists: use each tool's native config in the scanned repository:
+# PR vs batch (GitHub Actions sets GITHUB_EVENT_NAME automatically):
+#   - pull_request / pull_request_target + a resolved PR number → comments / PR review on that PR only
+#     (no Issues from Betterleaks or OSV; Semgrep as inline review, not an autofix branch).
+#   - schedule, workflow_dispatch, push, … → Issues for secrets & OSV; Semgrep tries an autofix PR or opens
+#     a tracking Issue if autofix produces no commit.
+#   - Local testing of “PR mode”: set GITHUB_EVENT_NAME=pull_request and APPSEC_CREW_PR_NUMBER=<n> (and
+#     GITHUB_TOKEN / GITHUB_REPOSITORY as usual).
+#
+# Tool-native allowlists (in the scanned repo, not duplicated here):
 #   - Betterleaks / Gitleaks: `.betterleaks.toml` or `.gitleaks.toml`
-#   - OSV-Scanner: `osv-scanner.toml` (see examples/osv-scanner.toml.example)
-#   - Semgrep: `.semgrep.yml` (see examples/semgrep-local-rules.example.yml)
+#     (Betterleaks: https://github.com/betterleaks/betterleaks — Gitleaks-compatible options)
+#   - OSV-Scanner: `osv-scanner.toml` — start from this repo’s examples/osv-scanner.toml.example
+#     (upstream: https://google.github.io/osv-scanner/configuration/ )
+#   - Semgrep: `.semgrep.yml` — see examples/semgrep-local-rules.example.yml
+#     (upstream: https://semgrep.dev/docs/writing-rules/rule-syntax/ )
 #
 # Scanner scope: by default the workspace is scanned recursively (Betterleaks `dir` on the repo tree,
 # OSV `scan -r`, Semgrep `scan` on the repo root). Stderr logs each invocation as JSON with full argv.
@@ -23,7 +33,8 @@
 #
 # Tool CLI overrides (per agent `tools` block):
 #   - betterleaks: `version`, `extra_args` (list), `command` (optional full template: {binary} {repo} {report} {config})
-#   - osv_scanner: `version`, `scan_extra_args`, `scan_command`, `fix_extra_args` (same placeholders + {config} on scan)
+#   - osv_scanner: `version`, `scan_extra_args`, `scan_command` (same placeholders + {config} on scan);
+#     `fix_extra_args` exists in schema for compatibility but batch runs no longer invoke `osv-scanner fix`.
 #   - semgrep: `version`, `extra_args`, `command` — include a space before `--json`, e.g.
 #     "{binary} scan {autofix}{config_args} --json -o {report} {repo}"
 #   - `llm_triage: false` under a tool disables the false-positive triage pass for that agent (default true).

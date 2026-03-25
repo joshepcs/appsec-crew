@@ -1,8 +1,14 @@
 # Bundled default — used when the scanned repository has no `appsec_crew.yaml`.
-# Same baseline as repo-root `appsec_crew.yaml`: Jira, webhook, and Splunk stay disabled.
-# Copy the example to `appsec_crew.yaml` to customize.
+# Canonical human-edited template: appsec_crew.yaml at the root of the appsec-crew repository (copy that
+# file into your app repo to customize). This bundled copy stays in sync as the package fallback.
+#
+# Jira, webhook, and Splunk stay disabled here. PR vs batch behavior follows GITHUB_EVENT_NAME and PR number
+# (see appsec_crew.yaml header in the appsec-crew repo).
 #
 # CrewAI: each enabled agent needs `llm.api_key` or `llm.api_key_env`.
+#
+# Tool configs in the scanned repo: .betterleaks.toml / .gitleaks.toml, osv-scanner.toml, .semgrep.yml.
+# Examples ship under examples/ in the appsec-crew repo (osv-scanner.toml.example, semgrep-local-rules.example.yml).
 
 global:
   min_severity: high
@@ -38,7 +44,7 @@ agents:
         config_path: null
         # scan_extra_args: []
         # scan_command: null     # "{binary} scan -r -f json --output {report} {repo}" pattern if overriding
-        # fix_extra_args: []     # appended to osv-scanner fix …
+        # fix_extra_args: []     # reserved; batch flow does not open OSV remediation PRs
         # llm_triage: true      # opt-in (default off)
 
   code_reviewer:

@@ -16,6 +16,8 @@ class RuntimeContext:
     state: dict[str, Any] = field(default_factory=dict)
     github_event: dict[str, Any] | None = None
     pr_number: int | None = None
+    #: From ``GITHUB_EVENT_NAME`` (e.g. ``pull_request``, ``schedule``). Drives PR-comment vs batch Issues/PRs.
+    github_event_name: str | None = None
 
 
 CTX: RuntimeContext | None = None

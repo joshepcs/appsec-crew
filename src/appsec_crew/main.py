@@ -43,7 +43,14 @@ def run_once(repo: Path, config_path: Path, used_bundled_fallback: bool) -> int:
         if pr_env and pr_env.isdigit():
             pr_number = int(pr_env)
 
-    ctx = RuntimeContext(settings=settings, repo_path=repo.resolve(), state={}, github_event=event, pr_number=pr_number)
+    ctx = RuntimeContext(
+        settings=settings,
+        repo_path=repo.resolve(),
+        state={},
+        github_event=event,
+        pr_number=pr_number,
+        github_event_name=os.environ.get("GITHUB_EVENT_NAME"),
+    )
     set_runtime_context(ctx)
 
     try:

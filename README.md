@@ -35,15 +35,15 @@
 
 ## Overview
 
-AppSec Crew runs **four sequential agents** that execute real security tools and open **GitHub issues / pull requests** from your workflow or CLI.
+AppSec Crew runs **four sequential agents** that execute real security tools and post results to **GitHub** (PR comments, Issues, and/or PRs — see [PR vs scheduled](#pr-vs-scheduled-cron--workflow_dispatch)).
 
 
-| Agent                     | Tooling                                     | Outcome                                              |
-| ------------------------- | ------------------------------------------- | ---------------------------------------------------- |
-| **secrets_reviewer**      | Betterleaks                                 | Issues per finding (secrets never pasted in body)    |
-| **dependencies_reviewer** | OSV-Scanner + `fix`                         | One remediation PR where supported                   |
-| **code_reviewer**         | Semgrep + `--autofix`                       | One PR with rationale                                |
-| **reporter**              | Markdown + optional Jira / webhook / Splunk | Summary & integrations under `agents.reporter.tools` |
+| Agent                     | Tooling                         | Outcome (depends on [run mode](#pr-vs-scheduled-cron--workflow_dispatch)) |
+| ------------------------- | ------------------------------- | ------------------------------------------------------------------------- |
+| **secrets_reviewer**      | Betterleaks                     | **PR**: summary on the PR, no Issues · **Batch**: one Issue per finding (no secret values in body) |
+| **dependencies_reviewer** | OSV-Scanner (`scan -r`)         | **PR**: summary only · **Batch**: one umbrella Issue (vulnerable rows)    |
+| **code_reviewer**         | Semgrep (`scan`; batch uses `--autofix` when opening a PR) | **PR**: review with inline comments · **Batch**: autofix PR or tracking Issue if no fix commit |
+| **reporter**              | Markdown + optional Jira / webhook / Splunk | Summary comment on PR when `pull_request*` + PR #; integrations under `agents.reporter.tools` |
 
 
 Orchestration is **always CrewAI**. Every **enabled** agent must resolve an LLM API key (`llm.api_key` or `llm.api_key_env`).
@@ -78,7 +78,7 @@ Never commit secrets. Use **GitHub Actions secrets** and optional YAML overrides
 
 ```
 ├── assets/                    # Branding (ASCII banner, optional png mark)
-├── examples/                  # Sample Semgrep / OSV snippets
+├── examples/                  # `osv-scanner.toml.example`, `semgrep-local-rules.example.yml` (see [below](#example-configuration-and-tool-files))
 ├── src/appsec_crew/           # Package source
 │   ├── bundled_appsec_crew.yaml
 │   ├── config/                # Crew agent & task YAML
@@ -102,6 +102,16 @@ If you **omit** `--config`:
 3. Packaged `**bundled_appsec_crew.yaml`** (reporter Jira / webhook / Splunk **off**)
 
 An explicit `--config /path` must point to an existing file.
+
+### Example configuration and tool files
+
+| What you need | Where to get it |
+| ------------- | --------------- |
+| **Main AppSec Crew config** | Copy [`appsec_crew.yaml`](./appsec_crew.yaml) from this repository into the **root of the repository you scan** (same filename). That file is the maintained template; comments describe PR vs batch behavior and env vars. |
+| **Fallback when no file in the scan target** | The Python package ships [`src/appsec_crew/bundled_appsec_crew.yaml`](./src/appsec_crew/bundled_appsec_crew.yaml) — same baseline (reporter integrations off). Use the repo-root template when you want to customize. |
+| **OSV-Scanner ignores / overrides** | Start from [`examples/osv-scanner.toml.example`](./examples/osv-scanner.toml.example) → save as `osv-scanner.toml` in the scanned repo. Full reference: [OSV-Scanner configuration](https://google.github.io/osv-scanner/configuration/). |
+| **Semgrep local rules / metadata** | Sample rules in [`examples/semgrep-local-rules.example.yml`](./examples/semgrep-local-rules.example.yml) → merge or adapt into `.semgrep.yml` at the scan root. Rule syntax: [Semgrep docs](https://semgrep.dev/docs/writing-rules/rule-syntax/). |
+| **Secrets scanning allowlists** | `.betterleaks.toml` and/or `.gitleaks.toml` in the scanned repo ([Betterleaks](https://github.com/betterleaks/betterleaks)). |
 
 ### Tool versions (per agent)
 
@@ -136,7 +146,7 @@ Omit `version` and the runtime loads pins from the packaged [`bundled_appsec_cre
 - **False positives**: Optional **LLM triage** (`llm_triage: true` under each tool block) can dismiss likely false positives after scanning. **Default is off** so CI matches raw scanner output unless you opt in.
 - **Semgrep severity**: `global.min_severity` filters by rule severity. **`WARNING` counts like HIGH/ERROR** (rank 4) for the `high` threshold — Semgrep labels many real issues as WARNING. Missing / unknown severities default to HIGH. Explicit `INFO` / `LOW` / `MEDIUM` use the usual map.
 - **Semgrep registry packs**: Each `extra_configs` value is a Registry id (`p/...`). If any pack returns **404** or is invalid, Semgrep reports `errors` in the JSON and may scan **no files** (`paths.scanned` empty) — not a silent success. The bundled defaults use **`p/golang`** for Go rules (`p/go` no longer resolves on the registry).
-- **Overrides**: Append flags with `extra_args` / `scan_extra_args` / `fix_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted `--config …` tokens) and `{autofix}` (`--autofix ` or empty). Put a **space before `--json`** in custom Semgrep templates, e.g. `… {config_args} --json -o {report} {repo}`.
+- **Overrides**: Append flags with `extra_args` / `scan_extra_args`, or replace the built argv with a formatted `command` / `scan_command` string. Placeholders: `{binary}`, `{repo}`, `{report}`, `{config}`; Semgrep also `{config_args}` (quoted `--config …` tokens) and `{autofix}` (`--autofix ` or empty). Put a **space before `--json`** in custom Semgrep templates, e.g. `… {config_args} --json -o {report} {repo}`. The schema still accepts `fix_extra_args` for OSV for backward compatibility; the current **batch** flow does not run `osv-scanner fix` (dependencies are reported via Issues).
 
 ### CI: “0 Semgrep findings” vs `global.min_severity`
 
@@ -158,12 +168,16 @@ export GITHUB_TOKEN=...
 export GITHUB_REPOSITORY=owner/repo    # outside GitHub Actions
 export OPENAI_API_KEY=...
 
+# Optional: simulate PR mode (comments + Semgrep review, no Issues)
+# export GITHUB_EVENT_NAME=pull_request
+# export APPSEC_CREW_PR_NUMBER=123
+
 # Install betterleaks, osv-scanner, semgrep on PATH, then:
 appsec-crew --repo /path/to/repo-to-scan
 # appsec-crew --repo /path/to/repo --config /path/to/appsec_crew.yaml
 ```
 
-Copy [`appsec_crew.yaml`](./appsec_crew.yaml) into the **target** repo when you want a custom policy.
+Copy [`appsec_crew.yaml`](./appsec_crew.yaml) into the **target** repo when you want a custom policy; add tool configs from [`examples/`](./examples/) as needed ([details](#example-configuration-and-tool-files)).
 
 ---
 
@@ -267,6 +281,15 @@ jobs:
 
 `schedule` only runs on the **default** branch. Combine `pull_request`, `schedule`, and `workflow_dispatch` in one file if you prefer a single workflow.
 
+### PR vs scheduled (cron / `workflow_dispatch`)
+
+GitHub sets `GITHUB_EVENT_NAME` (and the action provides `GITHUB_EVENT_PATH`). AppSec Crew uses that plus a resolved PR number (`pull_request.number` from the event, or override `APPSEC_CREW_PR_NUMBER`) to choose behavior:
+
+| Mode | Betterleaks | OSV-Scanner | Semgrep |
+| ---- | ----------- | ------------ | ------- |
+| **PR** (`pull_request` / `pull_request_target` with PR #) | Findings only in the **PR summary comment** (no Issues) | Same: summary on the PR (no Issues, no remediation PR) | **PR review** with inline comments when possible (no autofix branch, no Issues) |
+| **Batch** (e.g. `schedule`, `workflow_dispatch`, `push`) | **GitHub Issues** (one per finding) | **One umbrella GitHub Issue** with vulnerable rows (no OSV remediation PR) | **Autofix PR** when Semgrep produces changes; if not, a **tracking Issue** |
+
 ---
 
 ## Exit codes
@@ -302,7 +325,7 @@ Suggested **repository topics** for discoverability:
 
 | Setting               | Suggestion                                                                                                                                                                                         |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Description**       | Short line: e.g. *CrewAI agents + Betterleaks, OSV-Scanner & Semgrep for GitHub — issues & PRs from CI*                                                                                            |
+| **Description**       | Short line: e.g. *CrewAI agents + Betterleaks, OSV-Scanner & Semgrep — PR comments on review, Issues & autofix PRs on schedule*                                                                  |
 | **Website**           | Link to this README or future docs site                                                                                                                                                            |
 | **Social preview**    | Screenshot the README banner or design a 1280×640 image in Settings → General                                                                                                                      |
 | **Security**          | Enable *Private vulnerability reporting* if you want GitHub’s advisory flow                                                                                                                        |

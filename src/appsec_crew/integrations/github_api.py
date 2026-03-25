@@ -69,3 +69,37 @@ class GitHubApi:
         )
         r.raise_for_status()
         return r.json()
+
+    def get_pull_request(self, pr_number: int) -> dict[str, Any]:
+        r = httpx.get(
+            self._url(f"/repos/{self.owner}/{self.repo}/pulls/{pr_number}"),
+            headers=self._headers,
+            timeout=60.0,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def create_pull_request_review(
+        self,
+        pr_number: int,
+        *,
+        commit_id: str,
+        body: str,
+        comments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Submit a PR review (``event=COMMENT``). Optional inline ``comments``: ``path``, ``line``, ``body``."""
+        payload: dict[str, Any] = {
+            "commit_id": commit_id,
+            "event": "COMMENT",
+            "body": body,
+        }
+        if comments:
+            payload["comments"] = comments
+        r = httpx.post(
+            self._url(f"/repos/{self.owner}/{self.repo}/pulls/{pr_number}/reviews"),
+            headers=self._headers,
+            json=payload,
+            timeout=120.0,
+        )
+        r.raise_for_status()
+        return r.json()

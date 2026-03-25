@@ -21,12 +21,7 @@ from appsec_crew.integrations.splunk_hec import send_event
 from appsec_crew.integrations.webhook_client import post_json
 from appsec_crew.runtime import RuntimeContext
 from appsec_crew.scanners.betterleaks_scan import run_betterleaks_scan
-from appsec_crew.scanners.osv_scan import (
-    discover_remediation_targets,
-    run_osv_fix_inplace,
-    run_osv_fix_override_pom,
-    run_osv_scan,
-)
+from appsec_crew.scanners.osv_scan import run_osv_scan
 from appsec_crew.scanners.semgrep_scan import build_semgrep_config_args, detect_primary_language, run_semgrep
 from appsec_crew.triage_llm import llm_triage_batch, partition_by_dismiss_indices
 from appsec_crew.settings import (
@@ -47,6 +42,127 @@ from appsec_crew.utils.severity import (
 def _git_remote_host() -> str:
     u = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     return u.replace("https://", "").replace("http://", "").rstrip("/")
+
+
+def _is_pr_scan_mode(ctx: RuntimeContext) -> bool:
+    """
+    True for ``pull_request`` / ``pull_request_target`` with a resolved PR number.
+
+    In this mode we only annotate the **current PR** (summary comment + optional inline Semgrep review);
+    we do **not** open GitHub Issues or AppSec-owned remediation PRs.
+    """
+    name = (ctx.github_event_name or os.environ.get("GITHUB_EVENT_NAME") or "").strip()
+    if name not in ("pull_request", "pull_request_target"):
+        return False
+    return ctx.pr_number is not None
+
+
+def _format_osv_rows_for_issue(rows: list[dict[str, Any]], cvss_min: float, label: str) -> str:
+    lines: list[str] = [
+        f"Automated **OSV-Scanner** report from AppSec Crew (minimum severity **{label}**, "
+        f"CVSS floor **{cvss_min}** when scored).\n",
+        "Ignored packages / IDs: configure `osv-scanner.toml` in this repository.\n",
+        "### Vulnerable package rows\n",
+    ]
+    for row in rows[:100]:
+        pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
+        name = pkg.get("name") or "?"
+        eco = pkg.get("ecosystem") or "?"
+        vulns = [v for v in (row.get("vulnerabilities") or []) if isinstance(v, dict)][:20]
+        vids = [str(v.get("id") or "?") for v in vulns]
+        lines.append(f"- **{name}** (`{eco}`): {', '.join(vids) if vids else '(no id)'}")
+    if len(rows) > 100:
+        lines.append(f"\n… and **{len(rows) - 100}** more row(s).")
+    return "\n".join(lines)
+
+
+def _semgrep_finding_line(finding: dict[str, Any]) -> int | None:
+    start = finding.get("start")
+    if isinstance(start, dict):
+        line = start.get("line")
+        if isinstance(line, int) and line > 0:
+            return line
+    return None
+
+
+def _post_semgrep_pr_review(
+    gh: GitHubApi,
+    pr_number: int,
+    findings: list[dict[str, Any]],
+) -> str | None:
+    """Post a PR review with inline comments where possible; fall back to issue comment. Returns review URL or None."""
+    try:
+        pr_data = gh.get_pull_request(pr_number)
+        commit_id = (pr_data.get("head") or {}).get("sha")
+        if not commit_id:
+            return None
+    except Exception:
+        return None
+
+    max_inline = 25
+    comments: list[dict[str, Any]] = []
+    for f in findings[:max_inline]:
+        path = f.get("path")
+        line = _semgrep_finding_line(f)
+        if not path or line is None:
+            continue
+        chk = f.get("check_id") or "?"
+        msg = ((f.get("extra") or {}).get("message") or "")[:400]
+        comments.append(
+            {
+                "path": str(path),
+                "line": line,
+                "body": (f"**Semgrep** `{chk}`\n\n{msg}" if msg else f"**Semgrep** `{chk}`"),
+            }
+        )
+
+    body = (
+        "### AppSec Crew — Semgrep\n\n"
+        f"**Findings** (after severity filter + triage): **{len(findings)}**\n\n"
+        f"Inline comments below: **{len(comments)}** (capped at {max_inline}; lines must be part of this PR diff).\n"
+    )
+    try:
+        if comments:
+            review = gh.create_pull_request_review(
+                pr_number, commit_id=str(commit_id), body=body, comments=comments
+            )
+        else:
+            listing = "\n".join(
+                f"- `{f.get('check_id')}` @ `{f.get('path')}`"
+                + (f":{_semgrep_finding_line(f)}" if _semgrep_finding_line(f) else "")
+                for f in findings[:50]
+            )
+            review = gh.create_pull_request_review(
+                pr_number,
+                commit_id=str(commit_id),
+                body=body + "\n### Findings\n\n" + listing,
+                comments=None,
+            )
+        url = review.get("html_url")
+        return str(url) if url else None
+    except Exception:
+        try:
+            listing = "\n".join(
+                f"- `{f.get('check_id')}` @ `{f.get('path')}`"
+                for f in findings[:50]
+            )
+            gh.create_pr_comment(pr_number, body + "\n### Findings\n\n" + listing)
+        except Exception:
+            pass
+        return None
+
+
+def _github_output_urls(agent: dict[str, Any]) -> list[str]:
+    """Collect non-empty GitHub URLs from agent state (issues, PRs, PR reviews)."""
+    out: list[str] = []
+    for u in agent.get("issue_urls") or []:
+        if u:
+            out.append(str(u))
+    for key in ("pr_url", "semgrep_review_url"):
+        v = agent.get(key)
+        if v:
+            out.append(str(v))
+    return out
 
 
 def _triage_secrets_findings(
@@ -208,24 +324,26 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
     dismissed_pub = _public_secret_dismissals(dismissed_raw)
     gh = _github_client(s)
     issue_urls: list[str] = []
-    for f in findings:
-        rid = f.get("RuleID") or f.get("rule_id") or "unknown-rule"
-        path = f.get("File") or f.get("file") or "?"
-        line = f.get("StartLine") or f.get("line") or "?"
-        title = f"[AppSec] Secret finding: {rid}"
-        body = (
-            "Automated report from **AppSec Crew** (Betterleaks).\n\n"
-            f"- **Rule**: `{rid}`\n"
-            f"- **Location**: `{path}` line {line}\n"
-            "- Secret value is **not** included in this issue.\n"
-            "- Ignore paths / allowlists: configure `.betterleaks.toml` / `.gitleaks.toml` in this repository.\n"
-        )
-        if gh:
+    pr_mode = _is_pr_scan_mode(ctx)
+    if gh and findings and not pr_mode:
+        for f in findings:
+            rid = f.get("RuleID") or f.get("rule_id") or "unknown-rule"
+            path = f.get("File") or f.get("file") or "?"
+            line = f.get("StartLine") or f.get("line") or "?"
+            title = f"[AppSec] Secret finding: {rid}"
+            body = (
+                "Automated report from **AppSec Crew** (Betterleaks).\n\n"
+                f"- **Rule**: `{rid}`\n"
+                f"- **Location**: `{path}` line {line}\n"
+                "- Secret value is **not** included in this issue.\n"
+                "- Ignore paths / allowlists: configure `.betterleaks.toml` / `.gitleaks.toml` in this repository.\n"
+            )
             iss = gh.create_issue(title, body, labels=["security", "appsec-crew"])
             issue_urls.append(iss.get("html_url", ""))
     ctx.state["secrets_reviewer"] = {
         "commands_executed": commands,
         "issue_urls": [u for u in issue_urls if u],
+        "pr_scan_mode": pr_mode,
         "scanner_findings_total": scanner_total,
         "findings_after_triage": len(findings),
         "dismissed_findings": dismissed_pub,
@@ -238,7 +356,12 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
 def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
     s = ctx.settings
     if not s.dependencies_reviewer.enabled:
-        ctx.state["dependencies_reviewer"] = {"executed": True, "skipped": True, "pr_url": None}
+        ctx.state["dependencies_reviewer"] = {
+            "executed": True,
+            "skipped": True,
+            "pr_url": None,
+            "issue_urls": [],
+        }
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
     dr = s.dependencies_reviewer
     repo = ctx.repo_path
@@ -270,6 +393,7 @@ def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
         "dismissed_findings": dismissed_pub,
         "commands_executed": commands,
         "pr_url": None,
+        "issue_urls": [],
         "executed": True,
     }
 
@@ -278,67 +402,34 @@ def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
 
     gh = _github_client(s)
     if not gh:
-        ctx.state["dependencies_reviewer"]["error"] = "No GitHub token/repo; skipped PR."
+        ctx.state["dependencies_reviewer"]["error"] = "No GitHub token/repo; skipped GitHub output."
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
-    targets = discover_remediation_targets(repo)
-    if not targets:
+    if _is_pr_scan_mode(ctx):
         ctx.state["dependencies_reviewer"]["note"] = (
-            "OSV reported vulnerabilities but no supported remediation target (e.g. package-lock.json, pom.xml) was found."
+            "PR scan mode: dependency findings are only in the PR summary comment (no GitHub Issue)."
         )
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
-    branch = f"appsec-crew/deps-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-    ensure_identity(repo, os.environ.get("GIT_COMMITTER_NAME", "appsec-crew"), os.environ.get("GIT_COMMITTER_EMAIL", "appsec-crew@users.noreply.github.com"))
-    create_branch(repo, branch)
-
-    for _hint, path in targets:
-        if path.name == "package-lock.json":
-            run_osv_fix_inplace(
-                path,
-                dr.osv_scanner_binary,
-                cvss_min,
-                extra_args=dr.osv_fix_extra_args,
-                commands_log=commands,
-            )
-        elif path.name == "pom.xml":
-            run_osv_fix_override_pom(
-                path,
-                dr.osv_scanner_binary,
-                cvss_min,
-                extra_args=dr.osv_fix_extra_args,
-                commands_log=commands,
-            )
-
     label = human_severity_label(min_lvl)
-    if not commit_all(
-        repo,
-        f"chore(appsec): remediate OSV findings (min severity {label})\n\nOpened by AppSec Crew (OSV-Scanner fix).",
-    ):
-        ctx.state["dependencies_reviewer"]["note"] = "No file changes after osv-scanner fix."
-        return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
-
-    push_with_token(repo, branch, gh.token, gh.owner + "/" + gh.repo, api_host=_git_remote_host())
-    base = gh.get_default_branch()
-    pr = gh.create_pull_request(
-        title=f"chore(appsec): dependency remediation (OSV, min {label})",
-        body=(
-            f"This PR applies **OSV-Scanner** guided remediation (`fix`) for vulnerabilities at or above **{label}** "
-            f"(CVSS ≥ {cvss_min} when a score exists).\n\n"
-            "Ignored IDs / packages: configure `osv-scanner.toml` in this repository.\n\n"
-            "Review lockfile and POM changes carefully before merging."
-        ),
-        head=branch,
-        base=base,
-    )
-    ctx.state["dependencies_reviewer"]["pr_url"] = pr.get("html_url")
+    title = f"[AppSec] OSV-Scanner: {len(rows)} vulnerable package row(s) (min {label})"
+    body = _format_osv_rows_for_issue(rows, cvss_min, label)
+    iss = gh.create_issue(title, body, labels=["security", "appsec-crew", "dependencies"])
+    url = iss.get("html_url", "")
+    ctx.state["dependencies_reviewer"]["issue_urls"] = [u for u in [url] if u]
     return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
 
 def run_code_pipeline(ctx: RuntimeContext) -> str:
     s = ctx.settings
     if not s.code_reviewer.enabled:
-        ctx.state["code_reviewer"] = {"executed": True, "skipped": True, "pr_url": None}
+        ctx.state["code_reviewer"] = {
+            "executed": True,
+            "skipped": True,
+            "pr_url": None,
+            "issue_urls": [],
+            "semgrep_review_url": None,
+        }
         return json.dumps(ctx.state["code_reviewer"], indent=2)
     cr = s.code_reviewer
     repo = ctx.repo_path
@@ -372,6 +463,8 @@ def run_code_pipeline(ctx: RuntimeContext) -> str:
         "dismissed_findings": dismissed_pub,
         "commands_executed": commands,
         "pr_url": None,
+        "issue_urls": [],
+        "semgrep_review_url": None,
         "executed": True,
     }
 
@@ -380,11 +473,33 @@ def run_code_pipeline(ctx: RuntimeContext) -> str:
 
     gh = _github_client(s)
     if not gh:
-        ctx.state["code_reviewer"]["error"] = "No GitHub token/repo; skipped PR."
+        ctx.state["code_reviewer"]["error"] = "No GitHub token/repo; skipped GitHub output."
         return json.dumps(ctx.state["code_reviewer"], indent=2)
 
+    label = human_severity_label(min_lvl)
+    reasons = "\n".join(
+        f"- `{f.get('check_id')}` @ `{f.get('path')}` — {((f.get('extra') or {}).get('message') or '')[:200]}"
+        for f in findings[:40]
+    )
+    if len(findings) > 40:
+        reasons += f"\n- … and {len(findings) - 40} more."
+
+    if _is_pr_scan_mode(ctx) and ctx.pr_number is not None:
+        review_url = _post_semgrep_pr_review(gh, ctx.pr_number, findings)
+        ctx.state["code_reviewer"]["semgrep_review_url"] = review_url
+        ctx.state["code_reviewer"]["pr_scan_mode"] = True
+        ctx.state["code_reviewer"]["note"] = (
+            "PR scan mode: Semgrep posted as PR review / comment (no autofix branch or Issues)."
+        )
+        return json.dumps(ctx.state["code_reviewer"], indent=2)
+
+    ctx.state["code_reviewer"]["pr_scan_mode"] = False
     branch = f"appsec-crew/semgrep-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-    ensure_identity(repo, os.environ.get("GIT_COMMITTER_NAME", "appsec-crew"), os.environ.get("GIT_COMMITTER_EMAIL", "appsec-crew@users.noreply.github.com"))
+    ensure_identity(
+        repo,
+        os.environ.get("GIT_COMMITTER_NAME", "appsec-crew"),
+        os.environ.get("GIT_COMMITTER_EMAIL", "appsec-crew@users.noreply.github.com"),
+    )
     create_branch(repo, branch)
     run_semgrep(
         repo,
@@ -397,19 +512,25 @@ def run_code_pipeline(ctx: RuntimeContext) -> str:
         commands_log=commands,
     )
 
-    reasons = "\n".join(
-        f"- `{f.get('check_id')}` @ `{f.get('path')}` — {((f.get('extra') or {}).get('message') or '')[:200]}"
-        for f in findings[:40]
-    )
-    if len(findings) > 40:
-        reasons += f"\n- … and {len(findings) - 40} more."
-
-    label = human_severity_label(min_lvl)
     if not commit_all(
         repo,
         f"fix(appsec): Semgrep autofix (min severity {label})\n\nOpened by AppSec Crew.",
     ):
-        ctx.state["code_reviewer"]["note"] = "Semgrep did not produce writable autofixes."
+        title = f"[AppSec] Semgrep: {len(findings)} finding(s), no autofix (min {label})"
+        body = (
+            "Scheduled **AppSec Crew** run: Semgrep reported findings but **no writable autofix** was produced "
+            "(rules may not support `--autofix`, or edits did not change tracked files).\n\n"
+            f"Primary language: **{lang}**. Minimum severity: **{label}**.\n\n"
+            "### Findings (sample)\n"
+            f"{reasons}\n\n"
+            "Configure ignores in `.semgrep.yml` and severity via `global.min_severity` in `appsec_crew.yaml`.\n"
+        )
+        iss = gh.create_issue(title, body, labels=["security", "appsec-crew", "semgrep"])
+        url = iss.get("html_url", "")
+        ctx.state["code_reviewer"]["issue_urls"] = [u for u in [url] if u]
+        ctx.state["code_reviewer"]["note"] = (
+            "Semgrep did not produce writable autofixes; opened a tracking GitHub Issue."
+        )
         return json.dumps(ctx.state["code_reviewer"], indent=2)
 
     push_with_token(repo, branch, gh.token, gh.owner + "/" + gh.repo, api_host=_git_remote_host())
@@ -434,10 +555,17 @@ def run_code_pipeline(ctx: RuntimeContext) -> str:
 def _markdown_report(ctx: RuntimeContext) -> str:
     repo = os.environ.get("GITHUB_REPOSITORY") or "unknown/repo"
     min_s = ctx.settings.min_severity().upper()
+    pr_scan = _is_pr_scan_mode(ctx)
+    run_mode = (
+        "**PR** — summary on this PR only (no Issues; Semgrep as PR review when possible)."
+        if pr_scan
+        else "**Batch / scheduled** — Issues for secrets & OSV; Semgrep autofix PR or a tracking Issue."
+    )
     lines = [
         "## AppSec Crew summary",
         "",
         f"- **Repository**: `{repo}`",
+        f"- **Run mode**: {run_mode}",
         f"- **Minimum severity (global)**: **{min_s}**",
         f"- **UTC time**: {datetime.now(timezone.utc).isoformat()}",
         "",
@@ -453,6 +581,10 @@ def _markdown_report(ctx: RuntimeContext) -> str:
         "",
     ]
     sr = ctx.state.get("secrets_reviewer") or {}
+    if sr.get("pr_scan_mode"):
+        lines.append(
+            "- **PR scan mode**: Betterleaks is summarized here only (**no** GitHub Issues opened)."
+        )
     lines.append(
         f"- Issues opened: {len(sr.get('issue_urls') or [])} "
         f"(after triage: **{sr.get('findings_after_triage', sr.get('findings_total', 'n/a'))}** actionable; "
@@ -479,6 +611,13 @@ def _markdown_report(ctx: RuntimeContext) -> str:
         f"- Vulnerable dependency rows (after CVSS filter + triage): **{dr.get('vulnerable_rows', 'n/a')}** "
         f"(pre-triage post-filter: **{dr.get('scanner_rows_after_cvss', 'n/a')}**)"
     )
+    if dr.get("note"):
+        lines.append(f"- Note: {dr['note']}")
+    diu = dr.get("issue_urls") or []
+    if diu:
+        lines.append(f"- **GitHub Issues**: {len(diu)}")
+        for u in diu:
+            lines.append(f"  - {u}")
     if dr.get("pr_url"):
         lines.append(f"- PR: {dr['pr_url']}")
     dcmds = dr.get("commands_executed") or []
@@ -500,8 +639,21 @@ def _markdown_report(ctx: RuntimeContext) -> str:
         f"(after severity filter, pre-triage: **{cr.get('scanner_findings_after_severity', 'n/a')}**; "
         f"raw from scan: **{cr.get('semgrep_findings_before_min_severity', 'n/a')}**)"
     )
+    if cr.get("pr_scan_mode"):
+        lines.append(
+            "- **PR scan mode**: Semgrep as PR review / comment (**no** autofix branch or Issue from this run)."
+        )
+    if cr.get("semgrep_review_url"):
+        lines.append(f"- **Semgrep PR review**: {cr['semgrep_review_url']}")
+    ciu = cr.get("issue_urls") or []
+    if ciu:
+        lines.append(f"- **GitHub Issues**: {len(ciu)}")
+        for u in ciu:
+            lines.append(f"  - {u}")
     if cr.get("pr_url"):
-        lines.append(f"- PR: {cr['pr_url']}")
+        lines.append(f"- **Autofix PR**: {cr['pr_url']}")
+    if cr.get("note") and not cr.get("pr_scan_mode"):
+        lines.append(f"- Note: {cr['note']}")
     ccmds = cr.get("commands_executed") or []
     if ccmds:
         lines.append("- **Tool commands executed:**")
@@ -548,9 +700,9 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
         "date": datetime.now(timezone.utc).isoformat(),
         "repo": repo_name,
         "results": {
-            "secrets-reviewer": sr_st.get("issue_urls") or [],
-            "dependencies-reviewer": [((dr_st.get("pr_url") or ""))] if dr_st.get("pr_url") else [],
-            "code-reviewer": [((cr_st.get("pr_url") or ""))] if cr_st.get("pr_url") else [],
+            "secrets-reviewer": _github_output_urls(sr_st),
+            "dependencies-reviewer": _github_output_urls(dr_st),
+            "code-reviewer": _github_output_urls(cr_st),
         },
         "dismissed_counts": {
             "secrets-reviewer": len(sr_st.get("dismissed_findings") or []),
@@ -559,8 +711,6 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
         },
         "jira_ticket": jira_key,
     }
-    payload["results"]["dependencies-reviewer"] = [x for x in payload["results"]["dependencies-reviewer"] if x]
-    payload["results"]["code-reviewer"] = [x for x in payload["results"]["code-reviewer"] if x]
 
     if rep.webhook.enabled and rep.webhook.url:
         headers = dict(rep.webhook.headers)
