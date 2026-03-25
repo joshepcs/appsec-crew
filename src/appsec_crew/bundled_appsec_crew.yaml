@@ -2,8 +2,8 @@
 # Canonical human-edited template: appsec_crew.yaml at the root of the appsec-crew repository (copy that
 # file into your app repo to customize). This bundled copy stays in sync as the package fallback.
 #
-# Jira, webhook, and Splunk stay disabled here. PR vs batch behavior follows GITHUB_EVENT_NAME and PR number
-# (see appsec_crew.yaml header in the appsec-crew repo).
+# Jira, webhook, and Splunk stay disabled here. PR mode: fail (exit 5) on actionable findings; no Jira/webhook/Splunk.
+# Batch mode: exit 0 with findings; integrations only run when enabled (see appsec_crew.yaml in this repo).
 #
 # CrewAI: each enabled agent needs `llm.api_key` or `llm.api_key_env`.
 #

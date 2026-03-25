@@ -11,7 +11,12 @@ from pathlib import Path
 
 from appsec_crew.crew import build_appsec_crew
 from appsec_crew.utils.llm import crew_llm_ready
-from appsec_crew.pipelines import validate_postconditions
+from appsec_crew.pipelines import (
+    _is_pr_scan_mode,
+    pr_scan_has_actionable_findings,
+    pr_scan_summary_for_ci,
+    validate_postconditions,
+)
 from appsec_crew.runtime import RuntimeContext, reset_runtime_context, set_runtime_context
 from appsec_crew.settings import ensure_tool_config_files, load_settings, resolve_appsec_config_path
 
@@ -71,6 +76,19 @@ def run_once(repo: Path, config_path: Path, used_bundled_fallback: bool) -> int:
             for e in errs:
                 print(f"  - {e}", file=sys.stderr)
             return 2
+
+        if _is_pr_scan_mode(ctx) and pr_scan_has_actionable_findings(ctx):
+            md = pr_scan_summary_for_ci(ctx)
+            if md.strip():
+                print("\n--- Reporter ---\n")
+                print(md)
+            print(
+                "Pull request scan failed: actionable security findings remain after filters/triage. "
+                "See the PR comment (if reporter is enabled) for counts and where to add tool-native exceptions "
+                "(.betterleaks.toml / .gitleaks.toml, osv-scanner.toml, .semgrep.yml).",
+                file=sys.stderr,
+            )
+            return 5
 
         print("AppSec Crew completed. Tool configs ensured:", json.dumps(ensured, indent=2))
         if used_bundled_fallback:

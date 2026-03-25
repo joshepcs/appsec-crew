@@ -7,7 +7,17 @@ from unittest.mock import MagicMock
 
 import yaml
 
-from appsec_crew.pipelines import _github_output_urls, _is_pr_scan_mode, run_code_pipeline, run_dependencies_pipeline, run_secrets_pipeline
+from appsec_crew.pipelines import (
+    _github_output_urls,
+    _is_pr_scan_mode,
+    pr_scan_actionable_findings_counts,
+    pr_scan_has_actionable_findings,
+    pr_scan_summary_for_ci,
+    run_code_pipeline,
+    run_dependencies_pipeline,
+    run_reporter_pipeline,
+    run_secrets_pipeline,
+)
 from appsec_crew.runtime import RuntimeContext
 from appsec_crew.settings import load_settings
 
@@ -311,3 +321,126 @@ def test_code_batch_opens_issue_when_no_autofix_commit(tmp_path: Path, monkeypat
     mock_gh.create_pull_request.assert_not_called()
     mock_gh.create_issue.assert_called_once()
     assert ctx.state["code_reviewer"]["issue_urls"] == ["https://github.com/o/r/issues/77"]
+
+
+def _reporter_agents_all_disabled_webhook_on() -> dict:
+    return {
+        "secrets_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"betterleaks": {}}},
+        "dependencies_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"osv_scanner": {}}},
+        "code_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"semgrep": {}}},
+        "reporter": {
+            "enabled": True,
+            "llm": {"api_key": "k"},
+            "tools": {
+                "jira": {"enabled": False},
+                "webhook": {"enabled": True, "url": "https://hooks.example.com/appsec"},
+                "splunk": {"enabled": False},
+            },
+        },
+    }
+
+
+def test_reporter_skips_webhook_in_pr_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _cfg(tmp_path, _reporter_agents_all_disabled_webhook_on())
+    ctx = _ctx(tmp_path, cfg, pr_number=2, event_name="pull_request")
+    mock_post = MagicMock()
+    monkeypatch.setattr("appsec_crew.pipelines.post_json", mock_post)
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: MagicMock())
+    run_reporter_pipeline(ctx)
+    mock_post.assert_not_called()
+
+
+def test_reporter_calls_webhook_in_batch_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _cfg(tmp_path, _reporter_agents_all_disabled_webhook_on())
+    ctx = _ctx(tmp_path, cfg, pr_number=None, event_name="schedule")
+    mock_post = MagicMock()
+    monkeypatch.setattr("appsec_crew.pipelines.post_json", mock_post)
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: None)
+    run_reporter_pipeline(ctx)
+    mock_post.assert_called_once()
+
+
+def test_pr_scan_actionable_findings_counts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    cfg = _cfg(
+        tmp_path,
+        {
+            "secrets_reviewer": {"enabled": True, "llm": {"api_key": "k"}, "tools": {"betterleaks": {}}},
+            "dependencies_reviewer": {"enabled": True, "llm": {"api_key": "k"}, "tools": {"osv_scanner": {}}},
+            "code_reviewer": {"enabled": True, "llm": {"api_key": "k"}, "tools": {"semgrep": {}}},
+            "reporter": {
+                "enabled": False,
+                "llm": {"api_key": "k"},
+                "tools": {"jira": {"enabled": False}, "webhook": {"enabled": False}, "splunk": {"enabled": False}},
+            },
+        },
+    )
+    ctx = _ctx(tmp_path, cfg, pr_number=1, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {"executed": True, "skipped": False, "findings_after_triage": 2}
+    ctx.state["dependencies_reviewer"] = {"executed": True, "skipped": False, "vulnerable_rows": 3}
+    ctx.state["code_reviewer"] = {"executed": True, "skipped": False, "findings": 0}
+    assert pr_scan_actionable_findings_counts(ctx) == {"secrets": 2, "dependencies": 3}
+    assert pr_scan_has_actionable_findings(ctx) is True
+
+
+def test_pr_reporter_markdown_includes_failure_appendix(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _cfg(
+        tmp_path,
+        {
+            "secrets_reviewer": {"enabled": True, "llm": {"api_key": "k"}, "tools": {"betterleaks": {}}},
+            "dependencies_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"osv_scanner": {}}},
+            "code_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"semgrep": {}}},
+            "reporter": {
+                "enabled": True,
+                "llm": {"api_key": "k"},
+                "tools": {"jira": {"enabled": False}, "webhook": {"enabled": False}, "splunk": {"enabled": False}},
+            },
+        },
+    )
+    ctx = _ctx(tmp_path, cfg, pr_number=5, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {
+        "executed": True,
+        "skipped": False,
+        "findings_after_triage": 1,
+        "issue_urls": [],
+        "scanner_findings_total": 1,
+        "dismissed_findings": [],
+        "commands_executed": [],
+        "pr_scan_mode": True,
+    }
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: MagicMock())
+    run_reporter_pipeline(ctx)
+    md = ctx.state["reporter"]["markdown"]
+    assert "Pull request check failed" in md
+    assert ".betterleaks.toml" in md
+
+
+def test_pr_scan_summary_for_ci_without_reporter(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    cfg = _cfg(
+        tmp_path,
+        {
+            "secrets_reviewer": {"enabled": True, "llm": {"api_key": "k"}, "tools": {"betterleaks": {}}},
+            "dependencies_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"osv_scanner": {}}},
+            "code_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"semgrep": {}}},
+            "reporter": {
+                "enabled": False,
+                "llm": {"api_key": "k"},
+                "tools": {"jira": {"enabled": False}, "webhook": {"enabled": False}, "splunk": {"enabled": False}},
+            },
+        },
+    )
+    ctx = _ctx(tmp_path, cfg, pr_number=9, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {"executed": True, "skipped": False, "findings_after_triage": 1}
+    md = pr_scan_summary_for_ci(ctx)
+    assert "Pull request check failed" in md
+    assert ".betterleaks.toml" in md

@@ -49,12 +49,95 @@ def _is_pr_scan_mode(ctx: RuntimeContext) -> bool:
     True for ``pull_request`` / ``pull_request_target`` with a resolved PR number.
 
     In this mode we only annotate the **current PR** (summary comment + optional inline Semgrep review);
-    we do **not** open GitHub Issues or AppSec-owned remediation PRs.
+    we do **not** open GitHub Issues or AppSec-owned remediation PRs. The process **exits non-zero** if any
+    enabled scanner still has actionable findings after filters/triage. Jira, webhook, and Splunk are **not**
+    invoked (those run only in batch / scheduled mode).
     """
     name = (ctx.github_event_name or os.environ.get("GITHUB_EVENT_NAME") or "").strip()
     if name not in ("pull_request", "pull_request_target"):
         return False
     return ctx.pr_number is not None
+
+
+def pr_scan_actionable_findings_counts(ctx: RuntimeContext) -> dict[str, int]:
+    """
+    Per-agent actionable counts in PR context (after severity filters and LLM triage when enabled).
+
+    Only includes enabled agents that executed and were not skipped. Used to fail PR checks and to build
+    suppression hints.
+    """
+    out: dict[str, int] = {}
+    s = ctx.settings
+    sr = ctx.state.get("secrets_reviewer") or {}
+    if s.secrets_reviewer.enabled and sr.get("executed") and not sr.get("skipped"):
+        n = int(sr.get("findings_after_triage", sr.get("findings_total", 0)) or 0)
+        if n > 0:
+            out["secrets"] = n
+    dr = ctx.state.get("dependencies_reviewer") or {}
+    if s.dependencies_reviewer.enabled and dr.get("executed") and not dr.get("skipped"):
+        n = int(dr.get("vulnerable_rows", 0) or 0)
+        if n > 0:
+            out["dependencies"] = n
+    cr = ctx.state.get("code_reviewer") or {}
+    if s.code_reviewer.enabled and cr.get("executed") and not cr.get("skipped"):
+        n = int(cr.get("findings", 0) or 0)
+        if n > 0:
+            out["code"] = n
+    return out
+
+
+def pr_scan_has_actionable_findings(ctx: RuntimeContext) -> bool:
+    return bool(pr_scan_actionable_findings_counts(ctx))
+
+
+def pr_scan_summary_for_ci(ctx: RuntimeContext) -> str:
+    """
+    Markdown for logs when a PR scan fails or when the reporter is disabled.
+
+    Prefer the reporter's body (includes failure appendix when findings) if present.
+    """
+    rep = ctx.state.get("reporter") or {}
+    existing = (rep.get("markdown") or "").strip()
+    if existing:
+        return str(rep["markdown"])
+    text = _markdown_report(ctx)
+    if _is_pr_scan_mode(ctx) and pr_scan_has_actionable_findings(ctx):
+        text += _pr_scan_findings_failure_appendix(ctx)
+    return text
+
+
+def _pr_scan_findings_failure_appendix(ctx: RuntimeContext) -> str:
+    """Markdown block appended to the PR summary when checks must fail on findings."""
+    counts = pr_scan_actionable_findings_counts(ctx)
+    lines = [
+        "",
+        "---",
+        "",
+        "### Pull request check failed",
+        "",
+        "This run reported **actionable findings** (after `global.min_severity` and optional LLM triage). "
+        "Resolve them in code or dependencies, or add **tool-native** allowlists if you accept the risk:",
+    ]
+    if "secrets" in counts:
+        lines.append(
+            f"- **Secrets (Betterleaks)** — {counts['secrets']} finding(s): edit **`.betterleaks.toml`** "
+            "or **`.gitleaks.toml`** in this repository (paths, rules, allowlists)."
+        )
+    if "dependencies" in counts:
+        lines.append(
+            f"- **Dependencies (OSV-Scanner)** — {counts['dependencies']} vulnerable row(s): edit **`osv-scanner.toml`** "
+            "(ignore packages or vulnerability IDs per [OSV configuration](https://google.github.io/osv-scanner/configuration/))."
+        )
+    if "code" in counts:
+        lines.append(
+            f"- **Code (Semgrep)** — {counts['code']} finding(s): edit **`.semgrep.yml`** "
+            "(e.g. `rules`, `paths`, `pattern-not`, nosemgrep comments where appropriate)."
+        )
+    lines += [
+        "",
+        "AppSec Crew does not encode suppressions in `appsec_crew.yaml`; use each scanner’s native config in the repo.",
+    ]
+    return "\n".join(lines)
 
 
 def _format_osv_rows_for_issue(rows: list[dict[str, Any]], cvss_min: float, label: str) -> str:
@@ -673,6 +756,8 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
         ctx.state["reporter"] = {"executed": True, "skipped": True, "markdown": ""}
         return "reporter disabled"
     text = _markdown_report(ctx)
+    if _is_pr_scan_mode(ctx) and pr_scan_has_actionable_findings(ctx):
+        text += _pr_scan_findings_failure_appendix(ctx)
     ctx.state["reporter"] = {"markdown": text, "executed": True}
 
     gh = _github_client(s)
@@ -682,7 +767,8 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
     repo_name = os.environ.get("GITHUB_REPOSITORY") or "unknown"
     rep = s.reporter
     jira_key = ""
-    if rep.jira.enabled and rep.jira.base_url and rep.jira.project_key and rep.jira.email and rep.jira.api_token:
+    batch_integrations = not _is_pr_scan_mode(ctx)
+    if batch_integrations and rep.jira.enabled and rep.jira.base_url and rep.jira.project_key and rep.jira.email and rep.jira.api_token:
         client = JiraApi(rep.jira.base_url, rep.jira.email, rep.jira.api_token)
         jira_key = upsert_appsec_ticket(
             client,
@@ -712,7 +798,7 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
         "jira_ticket": jira_key,
     }
 
-    if rep.webhook.enabled and rep.webhook.url:
+    if batch_integrations and rep.webhook.enabled and rep.webhook.url:
         headers = dict(rep.webhook.headers)
         for hk, ev in (rep.webhook.header_secrets or {}).items():
             val = os.environ.get(ev)
@@ -720,7 +806,7 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
                 headers[hk] = val
         post_json(rep.webhook.url, payload, headers=headers or None)
 
-    if rep.splunk.enabled and rep.splunk.hec_url and rep.splunk.token:
+    if batch_integrations and rep.splunk.enabled and rep.splunk.hec_url and rep.splunk.token:
         send_event(rep.splunk.hec_url, rep.splunk.token, payload, rep.splunk.source, rep.splunk.sourcetype)
 
     ctx.state["reporter"]["webhook_payload"] = payload

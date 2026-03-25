@@ -43,7 +43,7 @@ AppSec Crew runs **four sequential agents** that execute real security tools and
 | **secrets_reviewer**      | Betterleaks                     | **PR**: summary on the PR, no Issues · **Batch**: one Issue per finding (no secret values in body) |
 | **dependencies_reviewer** | OSV-Scanner (`scan -r`)         | **PR**: summary only · **Batch**: one umbrella Issue (vulnerable rows)    |
 | **code_reviewer**         | Semgrep (`scan`; batch uses `--autofix` when opening a PR) | **PR**: review with inline comments · **Batch**: autofix PR or tracking Issue if no fix commit |
-| **reporter**              | Markdown + optional Jira / webhook / Splunk | Summary comment on PR when `pull_request*` + PR #; integrations under `agents.reporter.tools` |
+| **reporter**              | Markdown + optional Jira / webhook / Splunk | **PR**: summary comment on the PR only (integrations **off**). **Batch**: same summary plus Jira / webhook / Splunk when enabled under `agents.reporter.tools`. |
 
 
 Orchestration is **always CrewAI**. Every **enabled** agent must resolve an LLM API key (`llm.api_key` or `llm.api_key_env`).
@@ -285,10 +285,10 @@ jobs:
 
 GitHub sets `GITHUB_EVENT_NAME` (and the action provides `GITHUB_EVENT_PATH`). AppSec Crew uses that plus a resolved PR number (`pull_request.number` from the event, or override `APPSEC_CREW_PR_NUMBER`) to choose behavior:
 
-| Mode | Betterleaks | OSV-Scanner | Semgrep |
-| ---- | ----------- | ------------ | ------- |
-| **PR** (`pull_request` / `pull_request_target` with PR #) | Findings only in the **PR summary comment** (no Issues) | Same: summary on the PR (no Issues, no remediation PR) | **PR review** with inline comments when possible (no autofix branch, no Issues) |
-| **Batch** (e.g. `schedule`, `workflow_dispatch`, `push`) | **GitHub Issues** (one per finding) | **One umbrella GitHub Issue** with vulnerable rows (no OSV remediation PR) | **Autofix PR** when Semgrep produces changes; if not, a **tracking Issue** |
+| Mode | Betterleaks | OSV-Scanner | Semgrep | Exit / integrations |
+| ---- | ----------- | ------------ | ------- | ------------------- |
+| **PR** (`pull_request` / `pull_request_target` with PR #) | Summary on the PR (no Issues) | Same | **PR review** + inline comments when possible | **Exit code 5** if any actionable findings remain; comment lists tool-native files for allowlists. **Jira, webhook, and Splunk are not called.** |
+| **Batch** (e.g. `schedule`, `workflow_dispatch`, `push`) | **GitHub Issues** (one per finding) | **One umbrella Issue** (no OSV remediation PR) | **Autofix PR** or **tracking Issue** | **Exit 0** even with findings (job succeeds). Reporter may send **Jira / webhook / Splunk** when enabled. |
 
 ---
 
@@ -301,6 +301,7 @@ GitHub sets `GITHUB_EVENT_NAME` (and the action provides `GITHUB_EVENT_PATH`). A
 | 2    | Validation failed                    |
 | 3    | Missing LLM key for an enabled agent |
 | 4    | Config path error                    |
+| 5    | **PR scan only**: actionable findings after filters/triage (fails the check; see PR comment for suppression hints) |
 
 
 ---
