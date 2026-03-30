@@ -102,7 +102,11 @@ def main() -> int:
 
     repo = args.repo.resolve()
     report = Path(tempfile.mkdtemp(prefix="osv-ci-")) / "osv.json"
-    cmd = [args.binary, "scan", "-r", "-f", "json", "--output", str(report), str(repo)]
+    cfg = repo / "osv-scanner.toml"
+    cmd = [args.binary, "scan"]
+    if cfg.is_file():
+        cmd += ["--config", str(cfg)]
+    cmd += ["-r", "-f", "json", "--output", str(report), str(repo)]
     proc = subprocess.run(cmd, cwd=str(repo), text=True, capture_output=True)
     if proc.returncode not in (0, 1):
         print(proc.stderr or proc.stdout, file=sys.stderr)
