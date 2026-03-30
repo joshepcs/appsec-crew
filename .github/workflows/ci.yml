@@ -80,6 +80,7 @@ jobs:
         run: python scripts/ci_osv_gate.py --repo "${GITHUB_WORKSPACE}" --min-severity medium
 
       # No --config auto: Semgrep requires metrics for "auto" when SEMGREP_SEND_METRICS=off.
+      # p/yaml is not a Registry pack (404); p/github-actions covers workflow YAML under .github/.
       - name: Semgrep (WARNING and ERROR only; fail on findings)
         env:
           SEMGREP_SEND_METRICS: off
@@ -88,7 +89,7 @@ jobs:
           semgrep scan \
             --config p/security-audit \
             --config p/python \
-            --config p/yaml \
+            --config p/github-actions \
             --severity WARNING \
             --severity ERROR \
             --error \
