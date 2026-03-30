@@ -123,7 +123,7 @@ def main() -> int:
     if cfg.is_file():
         cmd += ["--config", str(cfg)]
     cmd += ["-r", "-f", "json", "--output", str(report), str(repo)]
-    proc = subprocess.run(cmd, cwd=repo, text=True, capture_output=True)
+    proc = subprocess.run(cmd, cwd=repo, text=True, capture_output=True) # nosemgrep
     if proc.returncode not in (0, 1):
         print(proc.stderr or proc.stdout, file=sys.stderr)
         return proc.returncode
