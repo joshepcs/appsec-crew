@@ -46,13 +46,29 @@ def _git_remote_host() -> str:
 
 def _effective_betterleaks_scan_kind(ctx: RuntimeContext, configured: str) -> str:
     """
-    Use ``betterleaks git`` on ``workflow_dispatch`` and ``pull_request`` (full history).
+    Choose between ``betterleaks git`` (full commit-history scan) and
+    ``betterleaks dir`` (working-tree scan) based on the GitHub event.
 
-    Otherwise use the configured ``scan_kind`` from YAML (default ``git``; set ``dir`` for working-tree only).
+    ``pull_request``:
+        Use ``dir`` — scans the current working tree, which reflects exactly
+        the files changed by the PR. GitHub Actions creates a synthetic merge
+        commit (``refs/pull/N/merge``) as the checkout HEAD; ``betterleaks git``
+        traverses ``git log -p`` from that merge commit and may not reach the
+        feature-branch commits where secrets were introduced, causing false
+        negatives. ``dir`` is reliable because it always scans what is on disk.
+
+    ``workflow_dispatch`` / ``schedule`` / other batch events:
+        Use ``git`` — scans full commit history to catch secrets that were
+        committed and later removed (deleted from the tree but still in history).
+
+    The YAML ``scan_kind`` setting is respected for all non-pull_request events
+    that don't fall into the explicit overrides above.
     """
     event = (ctx.github_event_name or os.environ.get("GITHUB_EVENT_NAME") or "").strip()
-    if event in ("workflow_dispatch", "pull_request"):
-        return "git"
+    if event == "pull_request":
+        return "dir"   # working-tree scan — reliable for PR review context
+    if event == "workflow_dispatch":
+        return "git"   # full history scan for scheduled/manual batch runs
     return configured if configured in ("dir", "git") else "git"
 
 
