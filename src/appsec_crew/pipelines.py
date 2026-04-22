@@ -159,14 +159,21 @@ def _format_osv_rows_for_issue(rows: list[dict[str, Any]], cvss_min: float, labe
         f"CVSS floor **{cvss_min}** when scored).\n",
         "Ignored packages / IDs: configure `osv-scanner.toml` in this repository.\n",
         "### Vulnerable package rows\n",
+        "| Package | Version | Ecosystem | Vulnerability IDs | Max CVSS |",
+        "|---------|---------|-----------|-------------------|----------|",
     ]
     for row in rows[:100]:
         pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
         name = pkg.get("name") or "?"
+        version = pkg.get("version") or "unknown"
         eco = pkg.get("ecosystem") or "?"
         vulns = [v for v in (row.get("vulnerabilities") or []) if isinstance(v, dict)][:20]
         vids = [str(v.get("id") or "?") for v in vulns]
-        lines.append(f"- **{name}** (`{eco}`): {', '.join(vids) if vids else '(no id)'}")
+        # Compute max CVSS across all vulnerabilities in this row
+        scores = [s for s in (max_cvss_score(v) for v in vulns) if s is not None]
+        cvss_display = f"{max(scores):.1f}" if scores else "n/a"
+        vid_str = ", ".join(vids) if vids else "(no id)"
+        lines.append(f"| **{name}** | `{version}` | {eco} | {vid_str} | {cvss_display} |")
     if len(rows) > 100:
         lines.append(f"\n… and **{len(rows) - 100}** more row(s).")
     return "\n".join(lines)
@@ -630,11 +637,32 @@ def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
     after_cvss = len(rows)
     rows, dismissed_raw = _triage_osv_rows(dr, rows)
     dismissed_pub = _public_osv_dismissals(dismissed_raw)
+    # Build a structured summary of vulnerable packages for use in PR comments and reporter state.
+    # This runs regardless of PR vs batch mode so the reporter agent always has package details.
+    vulnerable_packages = []
+    for row in rows[:50]:
+        pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
+        name = pkg.get("name") or "?"
+        version = pkg.get("version") or "unknown"
+        eco = pkg.get("ecosystem") or "?"
+        vulns = [v for v in (row.get("vulnerabilities") or []) if isinstance(v, dict)][:10]
+        vids = [str(v.get("id") or "?") for v in vulns]
+        scores = [s for s in (max_cvss_score(v) for v in vulns) if s is not None]
+        cvss_display = f"{max(scores):.1f}" if scores else "n/a"
+        vulnerable_packages.append({
+            "name": name,
+            "version": version,
+            "ecosystem": eco,
+            "vulnerability_ids": vids,
+            "max_cvss": cvss_display,
+        })
+
     ctx.state["dependencies_reviewer"] = {
         "vulnerable_rows": len(rows),
         "scanner_rows_after_cvss": after_cvss,
         "dismissed_findings": dismissed_pub,
         "commands_executed": commands,
+        "vulnerable_packages": vulnerable_packages,   # package-level detail for reporter/PR comment
         "pr_url": None,
         "issue_urls": [],
         "github_issue_reused_existing": False,
@@ -649,9 +677,27 @@ def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
         ctx.state["dependencies_reviewer"]["error"] = "No GitHub token/repo; skipped GitHub output."
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
-    if _is_pr_scan_mode(ctx):
+    if _is_pr_scan_mode(ctx) and ctx.pr_number is not None:
+        label = human_severity_label(min_lvl)
+        # Post a dedicated PR comment with the full package table (mirrors the Issue body format).
+        pr_body = _format_osv_rows_for_issue(rows, cvss_min, label)
+        pr_body = (
+            f"## 📦 Dependency Scan — OSV-Scanner ({len(rows)} vulnerable package row(s))\n\n"
+            + pr_body
+            + "\n\n> Configure ignores in `osv-scanner.toml`. "
+            "Severity threshold: `global.min_severity` in `appsec_crew.yaml`."
+        )
+        gh.create_pr_comment(ctx.pr_number, pr_body)
+        ctx.state["dependencies_reviewer"]["pr_scan_mode"] = True
         ctx.state["dependencies_reviewer"]["note"] = (
-            "PR scan mode: dependency findings are only in the PR summary comment (no GitHub Issue)."
+            "PR scan mode: OSV findings posted as PR comment (no GitHub Issue)."
+        )
+        return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
+
+    if _is_pr_scan_mode(ctx):
+        # PR mode but no PR number resolved — store data only, no comment possible.
+        ctx.state["dependencies_reviewer"]["note"] = (
+            "PR scan mode: dependency findings available in state (PR number not resolved)."
         )
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
