@@ -22,9 +22,13 @@ def run_scanner(
     if commands_log is not None:
         commands_log.append(shlex.join(cmd))
     ret = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
-    print("stdout:", ret.stdout,"...")
-    print("stderr:", ret.stderr,"...")
-    tmp_ret = subprocess.run(["find","/tmp","-name","'*.json'","-exec","cat","{}","\;"],cwd=str(cwd), Text=True, capture_output=True)
-    print("stdout:", tmp_ret.stdout,"...")
+    print("cmd:", cmd ,"...")
+    print("cwd:", cwd ,"...")
+    print("stdout1:", ret.stdout,"...")
+    print("stderr1:", ret.stderr,"...")
+    tmp_ret = subprocess.run(["find","/tmp","-name","'*.json'","-exec","cat","{}","\;"],cwd=str(cwd), text=True, capture_output=True)
+    print("stdout-find:", tmp_ret.stdout,"...")
+    tmp_ret = subprocess.run(["betterleaks","dir","--no-banner","-f","json","-r","/tmp/bl.json",str(cwd)],cwd=str(cwd), text=True, capture_output=True)
+    print("stdout-bl:", tmp_ret.stdout,"...")
     # print("stderr:", tmp_ret.stderr,"...")
     return ret 
