@@ -32,5 +32,11 @@ def run_scanner(
     print("stdout-bl:", tmp_ret.stdout,"...")
     print("stderr:", tmp_ret.stderr,"...")
     tmp_ret = subprocess.run(["ls","/tmp/bl.json"],cwd=str(cwd), text=True, capture_output=True)
-    print("stdout-find:", tmp_ret.stdout,"...")
+    print("stdout-ls:", tmp_ret.stdout,"...")
+    tmp_ret = subprocess.run(["cat","/tmp/bl.json"],cwd=str(cwd), text=True, capture_output=True)
+    print("stdout-cat:", tmp_ret.stdout,"...")
+    print("stderr:", tmp_ret.stderr,"...")
+    tmp_ret = subprocess.run(["cat",str(cwd)+"/app/config_insecure.py"],cwd=str(cwd), text=True, capture_output=True)
+    print("stdout-cat:", tmp_ret.stdout,"...")
+    print("stderr:", tmp_ret.stderr,"...")
     return ret 
