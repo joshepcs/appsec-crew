@@ -30,5 +30,7 @@ def run_scanner(
     print("stdout-find:", tmp_ret.stdout,"...")
     tmp_ret = subprocess.run(["betterleaks","dir","--no-banner","-f","json","-r","/tmp/bl.json",str(cwd)],cwd=str(cwd), text=True, capture_output=True)
     print("stdout-bl:", tmp_ret.stdout,"...")
-    # print("stderr:", tmp_ret.stderr,"...")
+    print("stderr:", tmp_ret.stderr,"...")
+    tmp_ret = subprocess.run(["ls","/tmp/bl.json"],cwd=str(cwd), text=True, capture_output=True)
+    print("stdout-find:", tmp_ret.stdout,"...")
     return ret 
