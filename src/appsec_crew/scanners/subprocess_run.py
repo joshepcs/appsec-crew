@@ -21,4 +21,10 @@ def run_scanner(
     log_tool_command(tool_label, cmd)
     if commands_log is not None:
         commands_log.append(shlex.join(cmd))
-    return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
+    ret = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
+    print("stdout:", ret.stdout,"...")
+    print("stderr:", ret.stderr,"...")
+    tmp_ret = subprocess.run(["find","/tmp","-name","'*.json'","-exec","cat","{}","\;"],cwd=str(cwd), Text=True, capture_output=True)
+    print("stdout:", tmp_ret.stdout,"...")
+    # print("stderr:", tmp_ret.stderr,"...")
+    return ret 
