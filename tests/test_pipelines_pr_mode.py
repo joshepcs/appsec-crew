@@ -527,4 +527,4 @@ def test_secrets_workflow_dispatch_passes_git_to_betterleaks(tmp_path: Path, mon
     monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: None)
     run_secrets_pipeline(ctx)
     assert captured["scan_kind"] == "git"
-    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "dir"
+    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
