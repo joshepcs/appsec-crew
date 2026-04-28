@@ -161,7 +161,7 @@ def test_secrets_batch_creates_issue(tmp_path: Path, monkeypatch) -> None:
     mock_gh.create_issue_deduped.assert_called_once()
     assert ctx.state["secrets_reviewer"]["issue_urls"] == ["https://github.com/o/r/issues/99"]
     assert ctx.state["secrets_reviewer"]["pr_scan_mode"] is False
-    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "dir"
+    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
 
 
 def test_dependencies_pr_mode_no_issue(tmp_path: Path, monkeypatch) -> None:
@@ -473,18 +473,18 @@ def test_effective_betterleaks_scan_kind_workflow_dispatch_forces_git(tmp_path: 
     assert _effective_betterleaks_scan_kind(ctx, "dir") == "git"
 
 
-def test_effective_betterleaks_scan_kind_pull_request_forces_git(tmp_path: Path, monkeypatch) -> None:
+def test_effective_betterleaks_scan_kind_pull_request_uses_dir(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
     cfg = _cfg(tmp_path, _agents_all_disabled())
     ctx = _ctx(tmp_path, cfg, pr_number=1, event_name="pull_request")
-    assert _effective_betterleaks_scan_kind(ctx, "dir") == "git"
+    assert _effective_betterleaks_scan_kind(ctx, "git") == "dir"
 
 
 def test_effective_betterleaks_scan_kind_falls_back_to_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     cfg = _cfg(tmp_path, _agents_all_disabled())
     ctx = _ctx(tmp_path, cfg, pr_number=None, event_name=None)
-    assert _effective_betterleaks_scan_kind(ctx, "dir") == "git"
+    assert _effective_betterleaks_scan_kind(ctx, "git") == "dir"
 
 
 def test_effective_betterleaks_scan_kind_schedule_uses_config(tmp_path: Path, monkeypatch) -> None:
