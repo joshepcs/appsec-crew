@@ -2,9 +2,12 @@
 # Replace or extend in your repository. See: https://github.com/betterleaks/betterleaks
 #
 # Betterleaks rejects an [allowlist] with empty paths/commits/regexes/stopwords — at least one is required.
+#  Note: the useDefault extension add the default ruleset to scan
+#   If it is not present, no leaks will be found (silent rule erasure)
 
 title = "appsec-crew-placeholder"
-
+[extend]
+useDefault = true 
 [allowlist]
 description = "Only this config file is ignored (may hold example strings). Add paths/regexes in your repo."
 paths = [
