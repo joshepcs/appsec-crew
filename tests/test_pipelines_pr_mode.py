@@ -125,7 +125,7 @@ def test_secrets_pr_mode_no_issues(tmp_path: Path, monkeypatch) -> None:
     mock_gh.create_issue_deduped.assert_not_called()
     assert ctx.state["secrets_reviewer"]["issue_urls"] == []
     assert ctx.state["secrets_reviewer"]["pr_scan_mode"] is True
-    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
+    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "dir"
 
 
 def test_secrets_batch_creates_issue(tmp_path: Path, monkeypatch) -> None:
@@ -161,7 +161,7 @@ def test_secrets_batch_creates_issue(tmp_path: Path, monkeypatch) -> None:
     mock_gh.create_issue_deduped.assert_called_once()
     assert ctx.state["secrets_reviewer"]["issue_urls"] == ["https://github.com/o/r/issues/99"]
     assert ctx.state["secrets_reviewer"]["pr_scan_mode"] is False
-    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
+    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "dir"
 
 
 def test_dependencies_pr_mode_no_issue(tmp_path: Path, monkeypatch) -> None:
@@ -527,4 +527,4 @@ def test_secrets_workflow_dispatch_passes_git_to_betterleaks(tmp_path: Path, mon
     monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: None)
     run_secrets_pipeline(ctx)
     assert captured["scan_kind"] == "git"
-    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
+    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "dir"
