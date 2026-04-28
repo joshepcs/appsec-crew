@@ -411,11 +411,157 @@ def _github_output_urls(agent: dict[str, Any]) -> list[str]:
     for u in agent.get("issue_urls") or []:
         if u:
             out.append(str(u))
-    for key in ("pr_url", "semgrep_review_url"):
+    for key in ("pr_url", "semgrep_review_url", "betterleaks_review_url"):
         v = agent.get(key)
         if v:
             out.append(str(v))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Betterleaks rendering — public, secret-safe views of findings.
+# Mirrors the Semgrep helpers above. The Secret / Match values from Betterleaks
+# JSON are NEVER included in any rendered output (PR comment, inline review,
+# state). The Fingerprint is `path:rule:line` and is safe to surface.
+# ---------------------------------------------------------------------------
+def _betterleaks_finding_safe_view(finding: dict[str, Any]) -> dict[str, Any]:
+    """Public, secret-safe view of a Betterleaks finding (no Match/Secret)."""
+    raw_path = finding.get("File") or finding.get("file") or ""
+    line_v = finding.get("StartLine") or finding.get("line")
+    end_v = finding.get("EndLine")
+    desc = (finding.get("Description") or "").strip()
+    return {
+        "rule_id": finding.get("RuleID") or finding.get("rule_id") or "?",
+        "path": _semgrep_repo_relative_path(str(raw_path)),
+        "line": int(line_v) if isinstance(line_v, int) else line_v,
+        "end_line": int(end_v) if isinstance(end_v, int) else end_v,
+        "description": desc,
+        "fingerprint": str(finding.get("Fingerprint") or ""),
+        "entropy": finding.get("Entropy"),
+    }
+
+
+def _betterleaks_findings_curated_section(
+    findings: list[dict[str, Any]], *, max_items: int = 25
+) -> str:
+    """Markdown table for the PR summary — never echoes Secret/Match values."""
+    if not findings:
+        return ""
+    rows: list[str] = [
+        "| # | File | Line | Rule | Description | Fingerprint |",
+        "|---|------|------|------|-------------|-------------|",
+    ]
+    for i, raw in enumerate(findings[:max_items], start=1):
+        v = _betterleaks_finding_safe_view(raw)
+        path = v["path"] or "(unknown)"
+        line = v["line"] if v["line"] is not None else "?"
+        desc = (v["description"] or "_No description._").replace("|", "\\|").replace("\n", " ")
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
+        fp = v["fingerprint"] or ""
+        if len(fp) > 80:
+            fp = fp[:77] + "..."
+        rows.append(
+            f"| {i} | `{path}` | {line} | `{v['rule_id']}` | {desc} | `{fp}` |"
+        )
+    out = "\n".join(rows)
+    if len(findings) > max_items:
+        out += (
+            f"\n\n_Showing **{max_items}** of **{len(findings)}** finding(s); "
+            "see the workflow log for the full JSON._"
+        )
+    out += (
+        "\n\n_Secret values are intentionally **not** included. "
+        "Rotate the credential, scrub it from git history (filter-repo / BFG), "
+        "and add the fingerprint to `.betterleaks.toml` only if the match is a confirmed false positive._"
+    )
+    return out
+
+
+def _betterleaks_inline_comment_body(finding: dict[str, Any]) -> str:
+    """Body for an inline PR review comment on the leak's line — secret is NOT echoed."""
+    v = _betterleaks_finding_safe_view(finding)
+    rid = v["rule_id"]
+    desc = v["description"] or "Potential hardcoded credential."
+    fp = v["fingerprint"]
+    lines = [
+        f"**Betterleaks** · `{rid}` · **secret leak**",
+        "",
+        desc,
+        "",
+        "**Action:** rotate the credential immediately, remove it from the working tree and from git history, "
+        "and load it from a secret manager / environment variable.",
+    ]
+    if fp:
+        lines.extend(
+            [
+                "",
+                "_Allowlist (only if false positive):_ add the fingerprint in `.betterleaks.toml`:",
+                "",
+                "```toml",
+                "[allowlist]",
+                f'fingerprints = ["{fp}"]',
+                "```",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _post_betterleaks_pr_review(
+    gh: GitHubApi,
+    pr_number: int,
+    findings: list[dict[str, Any]],
+) -> str | None:
+    """Post a PR review with inline comments per leak; fall back to issue comment. Returns review URL."""
+    try:
+        pr_data = gh.get_pull_request(pr_number)
+        commit_id = (pr_data.get("head") or {}).get("sha")
+        if not commit_id:
+            return None
+    except Exception:
+        return None
+
+    max_inline = 25
+    curated = _betterleaks_findings_curated_section(findings, max_items=max_inline)
+    comments: list[dict[str, Any]] = []
+    for f in findings[:max_inline]:
+        v = _betterleaks_finding_safe_view(f)
+        if not v["path"] or v["line"] is None:
+            continue
+        try:
+            line_int = int(v["line"])
+        except (TypeError, ValueError):
+            continue
+        comments.append(
+            {
+                "path": v["path"],
+                "line": line_int,
+                "body": _betterleaks_inline_comment_body(f),
+            }
+        )
+
+    body = (
+        "### AppSec Crew — Betterleaks\n\n"
+        f"**{len(findings)}** secret finding(s) after triage. "
+        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff "
+        f"(max {max_inline}). Secret values are not included in any comment.\n\n"
+        + curated
+    )
+    try:
+        review = gh.create_pull_request_review(
+            pr_number,
+            commit_id=str(commit_id),
+            body=body,
+            comments=comments if comments else None,
+        )
+        url = review.get("html_url")
+        return str(url) if url else None
+    except Exception:
+        try:
+            gh.create_pr_comment(pr_number, body)
+        except Exception:
+            pass
+        return None
 
 
 def _triage_secrets_findings(
@@ -584,15 +730,20 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
     issues_reused = 0
     if gh and findings and not pr_mode:
         for f in findings:
-            rid = f.get("RuleID") or f.get("rule_id") or "unknown-rule"
-            path = f.get("File") or f.get("file") or "?"
-            line = f.get("StartLine") or f.get("line") or "?"
+            v = _betterleaks_finding_safe_view(f)
+            rid = v["rule_id"] or "unknown-rule"
+            path = v["path"] or "?"
+            line = v["line"] if v["line"] is not None else "?"
+            desc = v["description"] or "Hardcoded credential detected."
+            fp = v["fingerprint"]
             title = f"[AppSec] Secret finding: {rid}"
             body = (
                 "Automated report from **AppSec Crew** (Betterleaks).\n\n"
                 f"- **Rule**: `{rid}`\n"
                 f"- **Location**: `{path}` line {line}\n"
-                "- Secret value is **not** included in this issue.\n"
+                f"- **Description**: {desc}\n"
+                + (f"- **Fingerprint**: `{fp}`\n" if fp else "")
+                + "- Secret value is **not** included in this issue.\n"
                 "- Ignore paths / allowlists: configure `.betterleaks.toml` / `.gitleaks.toml` in this repository.\n"
             )
             iss, created = gh.create_issue_deduped(title, body, labels=["security", "appsec-crew"])
@@ -603,6 +754,8 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
             url = iss.get("html_url", "")
             if url and url not in issue_urls:
                 issue_urls.append(url)
+    findings_pub = [_betterleaks_finding_safe_view(f) for f in findings]
+    findings_md = _betterleaks_findings_curated_section(findings)
     ctx.state["secrets_reviewer"] = {
         "betterleaks_scan_kind_used": scan_kind,
         "commands_executed": commands,
@@ -612,10 +765,23 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
         "findings_after_triage": len(findings),
         "dismissed_findings": dismissed_pub,
         "findings_total": len(findings),
+        "findings": findings_pub,
+        "findings_markdown": findings_md,
+        "betterleaks_review_url": None,
         "github_issues_created_new": issues_new,
         "github_issues_reused_existing": issues_reused,
         "executed": True,
     }
+    # PR mode: post an inline review on the leaks' lines (no secret echoed).
+    if (
+        findings
+        and pr_mode
+        and ctx.pr_number is not None
+        and gh is not None
+        and getattr(sr, "betterleaks_pr_inline_comments", True)
+    ):
+        review_url = _post_betterleaks_pr_review(gh, ctx.pr_number, findings)
+        ctx.state["secrets_reviewer"]["betterleaks_review_url"] = review_url
     return json.dumps(ctx.state["secrets_reviewer"], indent=2)
 
 
@@ -889,6 +1055,7 @@ def _markdown_report_pr_scan(ctx: RuntimeContext) -> str:
         "",
     ]
     sr = ctx.state.get("secrets_reviewer") or {}
+    secrets_detail_md = ""
     if s.secrets_reviewer.enabled and sr.get("executed") and not sr.get("skipped"):
         n = int(sr.get("findings_after_triage", sr.get("findings_total", 0)) or 0)
         raw = sr.get("scanner_findings_total", "n/a")
@@ -897,6 +1064,13 @@ def _markdown_report_pr_scan(ctx: RuntimeContext) -> str:
         lines.append(
             f"- **Betterleaks:** {n} finding(s) after triage (scanner raw: **{raw}**){bl_suffix}."
         )
+        bl_url = sr.get("betterleaks_review_url")
+        if bl_url:
+            lines.append(
+                f"  - [Betterleaks PR review]({bl_url}) — **rule, file, line, and description** "
+                "(inline comments on the diff; secret values never included)."
+            )
+        secrets_detail_md = (sr.get("findings_markdown") or "").strip()
     dr = ctx.state.get("dependencies_reviewer") or {}
     if s.dependencies_reviewer.enabled and dr.get("executed") and not dr.get("skipped"):
         lines.append(f"- **OSV-Scanner:** **{dr.get('vulnerable_rows', 0)}** vulnerable row(s) after CVSS filter + triage.")
@@ -914,6 +1088,8 @@ def _markdown_report_pr_scan(ctx: RuntimeContext) -> str:
         fm = (cr.get("findings_markdown") or "").strip()
         if fm and not cr.get("semgrep_review_url"):
             lines.extend(["", "### Semgrep — detail", "", fm])
+    if secrets_detail_md and not sr.get("betterleaks_review_url"):
+        lines.extend(["", "### Betterleaks — detail", "", secrets_detail_md])
     lines.extend(
         [
             "",

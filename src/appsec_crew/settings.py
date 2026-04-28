@@ -178,6 +178,9 @@ class SecretsReviewerSettings:
     betterleaks_command: str | None = None
     #: ``dir`` = working tree (CI default); ``git`` = full git history (noisier).
     betterleaks_scan_kind: str = "git"
+    #: When True (default), in PR mode also post inline review comments at each leak's line.
+    #: The comment body NEVER includes the secret value — only rule, description, fingerprint.
+    betterleaks_pr_inline_comments: bool = True
     llm_triage_findings: bool = True
 
 
@@ -315,6 +318,7 @@ def _load_secrets_reviewer(block: dict[str, Any], pin: ToolVersions) -> SecretsR
         betterleaks_extra_args=_str_list(bl.get("extra_args")),
         betterleaks_command=cmd_s,
         betterleaks_scan_kind=sk,
+        betterleaks_pr_inline_comments=bool(bl.get("pr_inline_comments", True)),
         llm_triage_findings=bool(bl.get("llm_triage", False)),
     )
 
