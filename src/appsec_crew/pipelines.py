@@ -730,6 +730,63 @@ def _post_betterleaks_pr_review(
         return None
 
 
+def _classify_secret_charset(s: str) -> str:
+    """Coarse charset class for a secret — used in triage redaction.
+
+    Helps the LLM recognize structural shapes (all-digits placeholders,
+    repeated alpha, hex digests) without seeing the value itself.
+
+    Order matters: ``hex`` is checked before ``alpha`` so MD5/SHA-style
+    digests (e.g. ``abcdef0123...``) are classified as ``hex`` rather than
+    falling through to the broader ``alpha``/``alnum`` buckets.
+    """
+    if not s:
+        return "empty"
+    if all(c.isdigit() for c in s):
+        return "digits"
+    if all(c in "0123456789abcdefABCDEF" for c in s):
+        return "hex"
+    if all(c.isalpha() for c in s):
+        return "alpha"
+    if all(c.isalnum() for c in s):
+        return "alnum"
+    return "alnum-symbols"
+
+
+def _redact_secret_in_match(match: str, secret: str) -> str:
+    """Replace ``secret`` in ``match`` with a structural placeholder.
+
+    The placeholder preserves the **prefix** (up to 8 chars) and the structural
+    metadata (remaining length, charset class). This is enough for the LLM to
+    recognize provider-marked test keys (``sk_test_``, ``pk_test_``, AWS docs
+    examples ``AKIAEXAMPLE…``, sequential/repeated patterns) WITHOUT the model
+    ever seeing the full credential value.
+
+    Examples::
+
+        match=`STRIPE = "sk_test_4Xk9mP2qL5nRjT8sYwZo3uC"`,
+        secret=`sk_test_4Xk9mP2qL5nRjT8sYwZo3uC`
+            -> `STRIPE = "<SECRET prefix=sk_test_ +24 alnum>"`
+
+        match=`AWS = "AKIAEXAMPLEXYZ12345"`, secret=`AKIAEXAMPLEXYZ12345`
+            -> `AWS = "<SECRET prefix=AKIAEXAM +11 alnum>"`
+
+    For very short secrets (< 12 chars) the visible prefix is reduced so the
+    leak ratio stays bounded. Returns ``match`` unchanged if ``secret`` is
+    empty or not found in ``match``.
+    """
+    if not secret or not match or secret not in match:
+        return match
+    n = len(secret)
+    # Cap prefix at 8 chars; halve for short secrets to bound the leak ratio.
+    prefix_len = 8 if n >= 12 else max(0, n // 2)
+    prefix = secret[:prefix_len]
+    rest = max(0, n - prefix_len)
+    charset = _classify_secret_charset(secret)
+    placeholder = f"<SECRET prefix={prefix} +{rest} {charset}>"
+    return match.replace(secret, placeholder)
+
+
 def _triage_secrets_findings(
     sr: SecretsReviewerSettings, findings: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -738,12 +795,46 @@ def _triage_secrets_findings(
     items = []
     for i, f in enumerate(findings):
         rid = f.get("RuleID") or f.get("rule_id") or "?"
-        path = f.get("File") or f.get("file") or "?"
+        raw_path = f.get("File") or f.get("file") or "?"
+        path = _semgrep_repo_relative_path(str(raw_path)) or str(raw_path)
         line = f.get("StartLine") or f.get("line") or "?"
-        items.append({"index": i, "rule_id": rid, "path": str(path), "line": line})
+        # Redacted match: enough shape for the LLM to spot test/example
+        # patterns (sk_test_*, AKIAEXAMPLE*, repeated/sequential strings,
+        # 'dummy'/'fake' substrings inside the prefix) without exfiltrating
+        # the credential value itself.
+        raw_match = str(f.get("Match") or f.get("match") or "")
+        secret = str(f.get("Secret") or f.get("secret") or "")
+        redacted = _redact_secret_in_match(raw_match, secret)
+        # Cap to keep prompt-token usage bounded.
+        if len(redacted) > 300:
+            redacted = redacted[:297] + "..."
+        items.append(
+            {
+                "index": i,
+                "rule_id": rid,
+                "path": path,
+                "line": line,
+                "match_redacted": redacted,
+                "fingerprint": str(f.get("Fingerprint") or ""),
+            }
+        )
     guidance = (
-        "Dismiss likely false positives: mocks/examples/placeholders, test fixtures, sample `.env` in docs, "
-        "strings clearly labeled fake, or paths that cannot hold production secrets."
+        "Triage Betterleaks (gitleaks-fork) findings. Each item shows a REDACTED "
+        "match where the secret value is replaced by `<SECRET prefix=... +N "
+        "charset=...>`. Use the prefix and structural shape — never the full "
+        "secret — to spot common false positives such as: "
+        "(a) provider-marked TEST keys: prefix `sk_test_`, `pk_test_`, "
+        "`AKIAEXAMPLE`, `AKIAIOSFODNN7EXAMPLE` (AWS docs example), repeating or "
+        "sequential charset classes (e.g. all `digits` of round count, or alpha "
+        "spelling out 'example'/'dummy'/'fake'); "
+        "(b) clearly-fake placeholders identifiable by the prefix tail "
+        "('dummy', 'fake', 'example', 'placeholder', 'changeme', 'xxxxxxx'); "
+        "(c) paths under tests/, examples/, docs/, or fixture-style directories. "
+        "Never echo the placeholder verbatim back, never request the full secret value. "
+        "DO NOT dismiss when the prefix indicates a live/production key "
+        "(`sk_live_`, `pk_live_`, `ghp_` followed by random alnum, `AKIA` "
+        "followed by random alnum NOT containing the substring EXAMPLE) and the "
+        "path is in production code (e.g. `app/`, `src/`, `lib/`)."
     )
     meta = llm_triage_batch(
         sr.llm,
@@ -793,17 +884,51 @@ def _triage_semgrep_findings(
     items = []
     for i, f in enumerate(findings):
         extra = f.get("extra") if isinstance(f.get("extra"), dict) else {}
+        # Code snippet — Semgrep emits the matched lines in extra.lines; this is
+        # the single biggest signal for FP triage. Without it the LLM has to
+        # decide on rule_id + path + generic rule message, which is far too
+        # little info for production-path findings (e.g. MD5 in a cache helper).
+        snippet = str(extra.get("lines") or "")
+        if len(snippet) > 600:
+            snippet = snippet[:597] + "..."
+        # CWE & severity from rule metadata help the LLM weigh impact.
+        meta_block = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+        cwe = meta_block.get("cwe")
+        if isinstance(cwe, list):
+            cwe = ", ".join(str(c) for c in cwe[:4]) if cwe else None
+        elif isinstance(cwe, str):
+            cwe = cwe.strip() or None
+        else:
+            cwe = None
+        rel_path = _semgrep_repo_relative_path(str(f.get("path") or ""))
+        line = _semgrep_finding_line(f)
         items.append(
             {
                 "index": i,
                 "check_id": f.get("check_id"),
-                "path": f.get("path"),
+                "path": rel_path or f.get("path"),
+                "line": line,
+                "severity": _semgrep_finding_severity(f),
+                "cwe": cwe,
                 "message": str(extra.get("message") or "")[:450],
+                "snippet": snippet,
+                "has_suggested_fix": bool(_semgrep_finding_fix(extra)),
             }
         )
     guidance = (
-        "Dismiss likely false positives: test-only code, dead branches, benign patterns, framework boilerplate, "
-        "or findings inconsistent with how the application actually uses the flagged code."
+        "Triage Semgrep findings using the snippet AND surrounding context. "
+        "Dismiss likely false positives such as: "
+        "(a) benign-but-flagged patterns where the rule matches syntactically but "
+        "the actual usage in the snippet shows the impact does not apply (e.g. "
+        "MD5 used for non-security purposes like ETag/cache key/dedup, NOT for "
+        "passwords or signed tokens; subprocess.run(shell=True) with a hardcoded "
+        "constant string and no user input; eval() on a Python literal; "
+        "assert isinstance() in tests where -O is never used); "
+        "(b) test-only code, dead branches, framework boilerplate; "
+        "(c) findings inconsistent with how the snippet shows the value flowing. "
+        "DO NOT dismiss when the snippet shows user-controlled input flowing into "
+        "the dangerous sink, when the path looks like auth/crypto/session code, or "
+        "when the rule message names a CVE/CWE that matches the snippet's pattern."
     )
     meta = llm_triage_batch(
         cr.llm,

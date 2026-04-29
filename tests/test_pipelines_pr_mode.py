@@ -664,6 +664,167 @@ def test_betterleaks_review_drops_inline_comments_outside_pr_diff() -> None:
     assert "Rotate the affected credentials regardless" in body
 
 
+def test_semgrep_triage_payload_includes_snippet_severity_cwe(monkeypatch) -> None:
+    """The triage prompt must carry the matched code (extra.lines), severity,
+    cwe, and a hint about whether the rule emitted a suggested fix. Without
+    these, the LLM cannot distinguish 'MD5 for passwords' from 'MD5 for cache
+    key'; the previous prompt only had check_id + path + message."""
+    from appsec_crew.pipelines import _triage_semgrep_findings
+    from appsec_crew.settings import CodeReviewerSettings, LlmAgentConfig
+
+    cr = CodeReviewerSettings(
+        enabled=True,
+        llm=LlmAgentConfig(api_key="dummy-key"),
+        llm_triage_findings=True,
+    )
+    finding = {
+        "check_id": "python.lang.security.audit.use-of-md5",
+        "path": "/home/runner/work/o/r/app/cache_utils.py",
+        "start": {"line": 35},
+        "extra": {
+            "lines": '    return hashlib.md5(blob).hexdigest()',
+            "message": "MD5 hash use",
+            "severity": "WARNING",
+            "fix": "hashlib.sha256(blob).hexdigest()",
+            "metadata": {"cwe": ["CWE-327"]},
+        },
+    }
+    captured = {}
+
+    def fake_triage(_cfg, *, agent_role, items, guidance, **_kw):
+        captured["agent_role"] = agent_role
+        captured["items"] = items
+        captured["guidance"] = guidance
+        return []
+
+    monkeypatch.setattr("appsec_crew.pipelines.llm_triage_batch", fake_triage)
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/home/runner/work/o/r")
+    _triage_semgrep_findings(cr, [finding])
+
+    assert captured["agent_role"] == "static analysis reviewer"
+    item = captured["items"][0]
+    assert item["check_id"] == "python.lang.security.audit.use-of-md5"
+    assert item["path"] == "app/cache_utils.py"        # workspace-relative
+    assert item["line"] == 35
+    assert item["severity"] == "WARNING"
+    assert item["cwe"] == "CWE-327"
+    assert "hashlib.md5" in item["snippet"]
+    assert item["has_suggested_fix"] is True
+    # Guidance must explicitly mention "snippet" so the model uses it.
+    assert "snippet" in captured["guidance"].lower()
+    # And nudge against trigger-happy dismissal.
+    assert "DO NOT dismiss" in captured["guidance"]
+
+
+# ---------------------------------------------------------------------------
+# Secrets triage: redacted match. The full secret value MUST NEVER appear in
+# the prompt sent to the LLM provider. The redactor preserves a short prefix +
+# structural metadata so the model can recognize sk_test_*, AKIAEXAMPLE*,
+# repeated/sequential placeholders without seeing the credential.
+# ---------------------------------------------------------------------------
+def test_redact_secret_in_match_keeps_prefix_hides_value() -> None:
+    from appsec_crew.pipelines import _redact_secret_in_match
+
+    match = 'STRIPE = "sk_test_4Xk9mP2qL5nRjT8sYwZo3uC"'
+    secret = "sk_test_4Xk9mP2qL5nRjT8sYwZo3uC"
+    assert len(secret) == 31
+    out = _redact_secret_in_match(match, secret)
+    # Provider TEST prefix preserved
+    assert "sk_test_" in out
+    # Full secret never present
+    assert "4Xk9mP2qL5nRjT8sYwZo3uC" not in out
+    assert secret not in out
+    # Structural placeholder shape: 31 - 8 (prefix) = 23 remaining chars
+    assert "<SECRET prefix=sk_test_" in out
+    assert "+23" in out
+
+
+def test_redact_secret_short_secret_uses_smaller_prefix() -> None:
+    from appsec_crew.pipelines import _redact_secret_in_match
+
+    out = _redact_secret_in_match("k = 'abcdefgh'", "abcdefgh")  # 8 chars
+    assert "abcdefgh" not in out
+    # For < 12-char secrets prefix is at most n//2 = 4
+    assert "<SECRET prefix=abcd" in out
+
+
+def test_redact_secret_returns_match_unchanged_when_secret_missing() -> None:
+    from appsec_crew.pipelines import _redact_secret_in_match
+
+    assert _redact_secret_in_match("hello world", "") == "hello world"
+    assert _redact_secret_in_match("hello world", "not-in-string") == "hello world"
+
+
+def test_classify_secret_charset_categories() -> None:
+    from appsec_crew.pipelines import _classify_secret_charset
+
+    assert _classify_secret_charset("") == "empty"
+    assert _classify_secret_charset("12345") == "digits"
+    assert _classify_secret_charset("abcdef") == "hex"
+    assert _classify_secret_charset("ABCdef0123") == "hex"
+    assert _classify_secret_charset("hello") == "alpha"
+    assert _classify_secret_charset("abc123XYZ") == "alnum"
+    assert _classify_secret_charset("abc-123!") == "alnum-symbols"
+
+
+def test_secrets_triage_payload_redacts_match_and_invariants(monkeypatch) -> None:
+    """End-to-end privacy invariant:
+
+    1) The full Secret value MUST NOT appear ANYWHERE in the items list passed
+       to llm_triage_batch (this is what crosses the trust boundary).
+    2) The Match field is redacted with a structural placeholder.
+    3) Path is normalized to repo-relative for prompt efficiency.
+    """
+    from appsec_crew.pipelines import _triage_secrets_findings
+    from appsec_crew.settings import LlmAgentConfig, SecretsReviewerSettings
+
+    sr = SecretsReviewerSettings(
+        enabled=True,
+        llm=LlmAgentConfig(api_key="dummy-key"),
+        llm_triage_findings=True,
+    )
+    secret_value = "sk_live_4Xk9mP2qL5nRjT8sYwZo3uC"   # MUST NEVER LEAK
+    finding = {
+        "RuleID": "stripe-access-token",
+        "File": "/home/runner/work/o/r/app/config_insecure.py",
+        "StartLine": 12,
+        "Match": f'STRIPE = "{secret_value}"',
+        "Secret": secret_value,
+        "Fingerprint": "app/config_insecure.py:stripe-access-token:12",
+    }
+    captured = {}
+
+    def fake_triage(_cfg, *, agent_role, items, guidance, **_kw):
+        captured["agent_role"] = agent_role
+        captured["items"] = items
+        captured["guidance"] = guidance
+        return []
+
+    monkeypatch.setattr("appsec_crew.pipelines.llm_triage_batch", fake_triage)
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/home/runner/work/o/r")
+    _triage_secrets_findings(sr, [finding])
+
+    # Privacy invariant: the secret value cannot appear in any field of any item.
+    serialized = repr(captured["items"])
+    assert secret_value not in serialized, (
+        "PRIVACY VIOLATION: full secret leaked into LLM payload"
+    )
+
+    item = captured["items"][0]
+    assert item["rule_id"] == "stripe-access-token"
+    assert item["path"] == "app/config_insecure.py"   # workspace-stripped
+    assert item["line"] == 12
+    assert "<SECRET prefix=sk_live_" in item["match_redacted"]
+    assert item["fingerprint"].endswith(":stripe-access-token:12")
+
+    # Guidance must clearly tell the model to dismiss test prefixes and NOT
+    # dismiss live ones, plus reaffirm "never echo the secret".
+    g = captured["guidance"]
+    assert "sk_test_" in g and "AKIAEXAMPLE" in g
+    assert "DO NOT dismiss" in g
+    assert "never request the full secret value" in g.lower()
+
+
 def test_review_does_not_filter_when_pr_files_endpoint_fails() -> None:
     """Graceful degradation: if list_pull_request_files errors, we skip the
     filter entirely (no signal != 'every path is out-of-diff'). This avoids
