@@ -1,0 +1,109 @@
+# AppSec Crew — example config: GitHub Models (Copilot via the OpenAI-compatible REST API)
+#
+# IMPORTANT — what this is and what it isn't:
+#
+#   This config targets **GitHub Models** (https://github.com/marketplace/models), the
+#   OpenAI-compatible inference endpoint that ships with any GitHub account.
+#   It is the supported, programmatic path for inference using a GitHub PAT.
+#
+#   This is NOT the GitHub Copilot Chat API (api.githubcopilot.com). That endpoint
+#   is non-public and intended for first-party clients (VS Code, JetBrains, Copilot CLI)
+#   authenticated via OAuth device flow. Using it programmatically requires
+#   reverse-engineered token handling and is generally outside Copilot Business ToS.
+#
+# Why this works without any code changes:
+#   - Models are written `github/<model_id>`. The slash means `_resolve_model` in
+#     src/appsec_crew/utils/llm.py leaves them untouched (no Anthropic prefix
+#     injection), and LiteLLM dispatches them to the GH Models endpoint based on
+#     the `github/` provider prefix.
+#   - Auth uses GITHUB_TOKEN (the same token already provided by `actions/checkout`)
+#     plus the `models:read` permission. For private repos you may want a PAT in a
+#     dedicated secret (e.g. GH_MODELS_TOKEN); change `api_key_env` accordingly.
+#
+# Workflow snippet (.github/workflows/appsec-crew-pr.yml):
+#
+#     permissions:
+#       contents: read
+#       issues: write
+#       pull-requests: write
+#       models: read           # <-- required for github/* models
+#     env:
+#       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#       GITHUB_REPOSITORY: ${{ github.repository }}
+#
+# Trade-offs vs. OpenAI direct:
+#   - + Free tier: no separate billing relationship, no extra secret to provision.
+#   - + Same auth as the rest of the workflow (one less rotation surface).
+#   - − Rate limits are per-account, generous for CI but not unlimited.
+#   - − The model catalogue rotates: pin a known-good model id and watch the
+#     marketplace for deprecation notices.
+#
+# Alternate routing (if `github/<model>` ever stops working with your LiteLLM
+# version): replace each `model:` line with the explicit base_url form, e.g.
+#
+#     llm:
+#       model: gpt-4o-mini
+#       base_url: https://models.github.ai/inference
+#       api_key_env: GITHUB_TOKEN
+#
+# `build_llm` propagates `base_url` to LiteLLM's `LLM(...)` and bypasses
+# `_resolve_model`'s auto-prefix logic, so the call goes straight to the GH
+# Models endpoint with the OpenAI client wire format.
+
+global:
+  min_severity: high
+  github:
+    token_env: GITHUB_TOKEN
+
+agents:
+  secrets_reviewer:
+    enabled: true
+    llm:
+      model: github/gpt-4o-mini
+      api_key_env: GITHUB_TOKEN
+      temperature: 0
+    tools:
+      betterleaks:
+        binary: betterleaks
+        version: v1.1.2
+
+  dependencies_reviewer:
+    enabled: true
+    llm:
+      model: github/gpt-4o-mini
+      api_key_env: GITHUB_TOKEN
+      temperature: 0
+    tools:
+      osv_scanner:
+        binary: osv-scanner
+        version: v2.3.3
+
+  code_reviewer:
+    enabled: true
+    llm:
+      model: github/gpt-4o                # bigger model for SAST triage; falls within the free tier
+      api_key_env: GITHUB_TOKEN
+      temperature: 0
+    tools:
+      semgrep:
+        binary: semgrep
+        version: "1.156.0"
+        extra_configs:
+          - auto
+          - p/security-audit
+          - p/python
+          - p/javascript
+
+  reporter:
+    enabled: true
+    llm:
+      model: github/gpt-4o-mini
+      api_key_env: GITHUB_TOKEN
+      temperature: 0
+    tools:
+      jira:
+        enabled: false
+      webhook:
+        enabled: false
+      splunk:
+        enabled: false

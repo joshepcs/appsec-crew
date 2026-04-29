@@ -1,0 +1,82 @@
+# AppSec Crew — example config: OpenAI only (gpt-4o-mini + gpt-4o)
+#
+# This is the "out of the box" path: the CrewAI/LiteLLM stack treats bare `gpt-*`
+# model strings as OpenAI by default, so no provider prefix or base_url is
+# required. `_resolve_model` in src/appsec_crew/utils/llm.py leaves these
+# strings untouched.
+#
+# Mixes models per agent:
+#   - gpt-4o-mini for the high-volume / pattern-matching agents (secrets, deps,
+#     reporter rendering).
+#   - gpt-4o for code analysis where deeper reasoning helps Semgrep triage.
+#
+# Auth: a single OpenAI API key, exported as OPENAI_API_KEY in the workflow env.
+#
+# Workflow snippet (.github/workflows/appsec-crew-pr.yml):
+#
+#     env:
+#       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+#       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#       GITHUB_REPOSITORY: ${{ github.repository }}
+#
+# Cost estimate (April 2026 pricing): ~ $0.008 / PR scan for a small repo
+# (gpt-4o is the bulk of the cost; switching code_reviewer to gpt-4o-mini
+# brings it down ~5x at the cost of weaker SAST triage).
+
+global:
+  min_severity: high      # critical | high | medium | low — filters OSV (CVSS) and Semgrep
+  github:
+    token_env: GITHUB_TOKEN
+
+agents:
+  secrets_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      temperature: 0
+    tools:
+      betterleaks:
+        binary: betterleaks
+        version: v1.1.2
+
+  dependencies_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      temperature: 0
+    tools:
+      osv_scanner:
+        binary: osv-scanner
+        version: v2.3.3
+
+  code_reviewer:
+    enabled: true
+    llm:
+      model: gpt-4o                       # use gpt-4o-mini to cut cost ~5x
+      api_key_env: OPENAI_API_KEY
+      temperature: 0
+    tools:
+      semgrep:
+        binary: semgrep
+        version: "1.156.0"
+        extra_configs:
+          - auto
+          - p/security-audit
+          - p/python
+          - p/javascript
+
+  reporter:
+    enabled: true
+    llm:
+      model: gpt-4o-mini                  # plain Markdown rendering, no need for gpt-4o
+      api_key_env: OPENAI_API_KEY
+      temperature: 0
+    tools:
+      jira:
+        enabled: false
+      webhook:
+        enabled: false
+      splunk:
+        enabled: false

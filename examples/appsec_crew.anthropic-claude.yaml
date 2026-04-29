@@ -1,0 +1,76 @@
+# AppSec Crew — example config: Anthropic Claude (Haiku for triage, Sonnet for SAST)
+#
+# Same shape as appsec-crew-testing-joshep-2's config. Mixes models per agent:
+#   - Haiku for the high-volume / pattern-matching agents (secrets, deps).
+#   - Sonnet for code analysis (Semgrep finding triage benefits from deeper reasoning)
+#     and for the reporter (Markdown phrasing).
+#
+# Auth: a single Anthropic API key, exported as ANTHROPIC_API_KEY in the workflow env.
+#
+# Why this routing works:
+# The bare `claude-*` model strings are auto-prefixed with `anthropic/` by
+# `_resolve_model` in src/appsec_crew/utils/llm.py so LiteLLM dispatches the
+# call directly to the Anthropic API (bypassing CrewAI's native provider path
+# that would otherwise hit api.openai.com — see commit cb80285).
+#
+# Cost estimate (April 2026 pricing): ~ $0.005 / PR scan for a small repo.
+
+global:
+  min_severity: high      # critical | high | medium | low — filters OSV (CVSS) and Semgrep
+  github:
+    token_env: GITHUB_TOKEN
+
+agents:
+  secrets_reviewer:
+    enabled: true
+    llm:
+      model: claude-haiku-4-5-20251001    # fast & cheap for secret triage
+      api_key_env: ANTHROPIC_API_KEY
+      temperature: 0
+    tools:
+      betterleaks:
+        binary: betterleaks
+        version: v1.1.2
+        # scan_kind: dir       # default for pull_request — see _effective_betterleaks_scan_kind
+        # llm_triage: true     # opt-in false-positive pass; off by default
+
+  dependencies_reviewer:
+    enabled: true
+    llm:
+      model: claude-haiku-4-5-20251001
+      api_key_env: ANTHROPIC_API_KEY
+      temperature: 0
+    tools:
+      osv_scanner:
+        binary: osv-scanner
+        version: v2.3.3
+
+  code_reviewer:
+    enabled: true
+    llm:
+      model: claude-sonnet-4-6            # deeper reasoning for SAST triage
+      api_key_env: ANTHROPIC_API_KEY
+      temperature: 0
+    tools:
+      semgrep:
+        binary: semgrep
+        version: "1.156.0"
+        extra_configs:
+          - auto
+          - p/security-audit
+          - p/python
+          - p/javascript
+
+  reporter:
+    enabled: true
+    llm:
+      model: claude-sonnet-4-6            # better Markdown phrasing for the PR comment
+      api_key_env: ANTHROPIC_API_KEY
+      temperature: 0
+    tools:
+      jira:
+        enabled: false
+      webhook:
+        enabled: false
+      splunk:
+        enabled: false
