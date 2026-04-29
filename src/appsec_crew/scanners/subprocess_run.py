@@ -21,4 +21,5 @@ def run_scanner(
     log_tool_command(tool_label, cmd)
     if commands_log is not None:
         commands_log.append(shlex.join(cmd))
+    
     return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)

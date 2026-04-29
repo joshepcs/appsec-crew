@@ -11,6 +11,9 @@ from appsec_crew.pipelines import (
     _effective_betterleaks_scan_kind,
     _github_output_urls,
     _is_pr_scan_mode,
+    _post_betterleaks_pr_review,
+    _post_semgrep_pr_review,
+    _pr_changed_paths,
     pr_scan_actionable_findings_counts,
     pr_scan_has_actionable_findings,
     pr_scan_summary_for_ci,
@@ -125,7 +128,7 @@ def test_secrets_pr_mode_no_issues(tmp_path: Path, monkeypatch) -> None:
     mock_gh.create_issue_deduped.assert_not_called()
     assert ctx.state["secrets_reviewer"]["issue_urls"] == []
     assert ctx.state["secrets_reviewer"]["pr_scan_mode"] is True
-    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
+    assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "dir"
 
 
 def test_secrets_batch_creates_issue(tmp_path: Path, monkeypatch) -> None:
@@ -281,8 +284,19 @@ def test_code_pr_mode_review_not_autofix_pr(tmp_path: Path, monkeypatch) -> None
     mock_gh.create_issue_deduped.assert_not_called()
     mock_gh.create_pull_request_review.assert_called_once()
     assert ctx.state["code_reviewer"]["semgrep_review_url"] == "https://github.com/o/r/pull/8#pullrequestreview-1"
-    body = mock_gh.create_pull_request_review.call_args.kwargs["body"]
-    assert "**Why:**" in body or "unsafe" in body
+    # When inline comments are present, the review body stays short to avoid GitHub's
+    # ~64 KB review-body limit. The per-finding detail (including `**Why:**`) lives
+    # inside each inline comment instead.
+    call_kwargs = mock_gh.create_pull_request_review.call_args.kwargs
+    body = call_kwargs["body"]
+    assert "AppSec Crew — Semgrep" in body
+    assert "**1** finding(s)" in body
+    inline_comments = call_kwargs["comments"]
+    assert isinstance(inline_comments, list) and len(inline_comments) == 1
+    inline_body = inline_comments[0]["body"]
+    assert "**Why:**" in inline_body or "unsafe" in inline_body
+    # findings_markdown remains in state so the reporter can render the table when
+    # the inline review is unavailable (e.g., review API rejects the request).
     assert "findings_markdown" in ctx.state["code_reviewer"]
     assert "app.py:4" in ctx.state["code_reviewer"]["findings_markdown"]
 
@@ -473,18 +487,18 @@ def test_effective_betterleaks_scan_kind_workflow_dispatch_forces_git(tmp_path: 
     assert _effective_betterleaks_scan_kind(ctx, "dir") == "git"
 
 
-def test_effective_betterleaks_scan_kind_pull_request_forces_git(tmp_path: Path, monkeypatch) -> None:
+def test_effective_betterleaks_scan_kind_pull_request_uses_dir(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
     cfg = _cfg(tmp_path, _agents_all_disabled())
     ctx = _ctx(tmp_path, cfg, pr_number=1, event_name="pull_request")
-    assert _effective_betterleaks_scan_kind(ctx, "dir") == "git"
+    assert _effective_betterleaks_scan_kind(ctx, "git") == "dir"
 
 
 def test_effective_betterleaks_scan_kind_falls_back_to_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     cfg = _cfg(tmp_path, _agents_all_disabled())
     ctx = _ctx(tmp_path, cfg, pr_number=None, event_name=None)
-    assert _effective_betterleaks_scan_kind(ctx, "dir") == "git"
+    assert _effective_betterleaks_scan_kind(ctx, "git") == "dir"
 
 
 def test_effective_betterleaks_scan_kind_schedule_uses_config(tmp_path: Path, monkeypatch) -> None:
@@ -528,3 +542,309 @@ def test_secrets_workflow_dispatch_passes_git_to_betterleaks(tmp_path: Path, mon
     run_secrets_pipeline(ctx)
     assert captured["scan_kind"] == "git"
     assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
+
+
+# ---------------------------------------------------------------------------
+# PR-diff filtering: GitHub rejects the entire review (422 "Path could not be
+# resolved") if any inline comment points to a file outside the PR diff.
+# Both Semgrep and Betterleaks reviews must pre-filter findings to in-diff
+# paths only, and surface the dropped count in the review body.
+# ---------------------------------------------------------------------------
+def test_pr_changed_paths_returns_set_of_filenames() -> None:
+    gh = MagicMock()
+    gh.list_pull_request_files.return_value = [
+        {"filename": "app/insecure.py", "status": "added"},
+        {"filename": "app/cache_utils.py", "status": "added"},
+        {"filename": "tests/test_x.py", "status": "added"},
+    ]
+    assert _pr_changed_paths(gh, 1) == {
+        "app/insecure.py",
+        "app/cache_utils.py",
+        "tests/test_x.py",
+    }
+
+
+def test_pr_changed_paths_empty_on_api_error() -> None:
+    gh = MagicMock()
+    gh.list_pull_request_files.side_effect = RuntimeError("network down")
+    assert _pr_changed_paths(gh, 1) == set()
+
+
+def test_semgrep_review_drops_inline_comments_outside_pr_diff() -> None:
+    """Reproduces the 422 'Path could not be resolved' the user hit: Semgrep
+    flags a file (`app/secure.py`) that exists on the branch but is unchanged
+    by this PR. The inline comment for that file MUST be dropped, and the
+    review payload submitted to GitHub MUST contain only in-diff paths."""
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef"}}
+    gh.list_pull_request_files.return_value = [
+        {"filename": "app/insecure.py", "status": "added"},
+        {"filename": "app/cache_utils.py", "status": "added"},
+    ]
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/1#pullrequestreview-1"
+    }
+
+    findings = [
+        {  # IN diff — should become an inline comment
+            "check_id": "python.lang.security.audit.use-of-md5",
+            "path": "app/cache_utils.py",
+            "start": {"line": 35},
+            "extra": {"message": "MD5 used", "severity": "WARNING"},
+        },
+        {  # IN diff — should become an inline comment
+            "check_id": "python.lang.security.audit.subprocess-shell-true",
+            "path": "app/insecure.py",
+            "start": {"line": 12},
+            "extra": {"message": "shell=True", "severity": "ERROR"},
+        },
+        {  # OUT of diff — must NOT be sent as inline comment
+            "check_id": "python.lang.security.audit.dangerous-system-call",
+            "path": "app/secure.py",
+            "start": {"line": 7},
+            "extra": {"message": "os.system", "severity": "WARNING"},
+        },
+    ]
+
+    url = _post_semgrep_pr_review(gh, 1, findings)
+    assert url == "https://github.com/o/r/pull/1#pullrequestreview-1"
+
+    payload = gh.create_pull_request_review.call_args.kwargs
+    submitted = payload["comments"]
+    submitted_paths = {c["path"] for c in submitted}
+    assert submitted_paths == {"app/cache_utils.py", "app/insecure.py"}
+    assert "app/secure.py" not in submitted_paths
+
+    # Body should mention that one finding lives outside the diff so the user
+    # doesn't lose visibility on it.
+    body = payload["body"]
+    assert "1** finding(s) live in files outside" in body
+    assert "**3** finding(s) after severity filter" in body
+    assert "**2** inline comment(s)" in body
+
+
+def test_betterleaks_review_drops_inline_comments_outside_pr_diff() -> None:
+    """Same diff-scoped filter applies to Betterleaks PR reviews."""
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef"}}
+    gh.list_pull_request_files.return_value = [
+        {"filename": "app/config_insecure.py", "status": "added"},
+    ]
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/1#pullrequestreview-2"
+    }
+
+    findings = [
+        {  # IN diff
+            "RuleID": "stripe-access-token",
+            "Description": "Stripe key",
+            "StartLine": 12,
+            "File": "app/config_insecure.py",
+            "Fingerprint": "app/config_insecure.py:stripe-access-token:12",
+        },
+        {  # OUT of diff — must NOT be sent inline
+            "RuleID": "github-pat",
+            "Description": "GitHub PAT",
+            "StartLine": 3,
+            "File": "scripts/legacy.py",
+            "Fingerprint": "scripts/legacy.py:github-pat:3",
+        },
+    ]
+
+    url = _post_betterleaks_pr_review(gh, 1, findings)
+    assert url == "https://github.com/o/r/pull/1#pullrequestreview-2"
+
+    payload = gh.create_pull_request_review.call_args.kwargs
+    submitted_paths = {c["path"] for c in payload["comments"]}
+    assert submitted_paths == {"app/config_insecure.py"}
+    assert "scripts/legacy.py" not in submitted_paths
+
+    body = payload["body"]
+    assert "1** finding(s) live in files outside" in body
+    assert "Rotate the affected credentials regardless" in body
+
+
+def test_semgrep_triage_payload_includes_snippet_severity_cwe(monkeypatch) -> None:
+    """The triage prompt must carry the matched code (extra.lines), severity,
+    cwe, and a hint about whether the rule emitted a suggested fix. Without
+    these, the LLM cannot distinguish 'MD5 for passwords' from 'MD5 for cache
+    key'; the previous prompt only had check_id + path + message."""
+    from appsec_crew.pipelines import _triage_semgrep_findings
+    from appsec_crew.settings import CodeReviewerSettings, LlmAgentConfig
+
+    cr = CodeReviewerSettings(
+        enabled=True,
+        llm=LlmAgentConfig(api_key="dummy-key"),
+        llm_triage_findings=True,
+    )
+    finding = {
+        "check_id": "python.lang.security.audit.use-of-md5",
+        "path": "/home/runner/work/o/r/app/cache_utils.py",
+        "start": {"line": 35},
+        "extra": {
+            "lines": '    return hashlib.md5(blob).hexdigest()',
+            "message": "MD5 hash use",
+            "severity": "WARNING",
+            "fix": "hashlib.sha256(blob).hexdigest()",
+            "metadata": {"cwe": ["CWE-327"]},
+        },
+    }
+    captured = {}
+
+    def fake_triage(_cfg, *, agent_role, items, guidance, **_kw):
+        captured["agent_role"] = agent_role
+        captured["items"] = items
+        captured["guidance"] = guidance
+        return []
+
+    monkeypatch.setattr("appsec_crew.pipelines.llm_triage_batch", fake_triage)
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/home/runner/work/o/r")
+    _triage_semgrep_findings(cr, [finding])
+
+    assert captured["agent_role"] == "static analysis reviewer"
+    item = captured["items"][0]
+    assert item["check_id"] == "python.lang.security.audit.use-of-md5"
+    assert item["path"] == "app/cache_utils.py"        # workspace-relative
+    assert item["line"] == 35
+    assert item["severity"] == "WARNING"
+    assert item["cwe"] == "CWE-327"
+    assert "hashlib.md5" in item["snippet"]
+    assert item["has_suggested_fix"] is True
+    # Guidance must explicitly mention "snippet" so the model uses it.
+    assert "snippet" in captured["guidance"].lower()
+    # And nudge against trigger-happy dismissal.
+    assert "DO NOT dismiss" in captured["guidance"]
+
+
+# ---------------------------------------------------------------------------
+# Secrets triage: redacted match. The full secret value MUST NEVER appear in
+# the prompt sent to the LLM provider. The redactor preserves a short prefix +
+# structural metadata so the model can recognize sk_test_*, AKIAEXAMPLE*,
+# repeated/sequential placeholders without seeing the credential.
+# ---------------------------------------------------------------------------
+def test_redact_secret_in_match_keeps_prefix_hides_value() -> None:
+    from appsec_crew.pipelines import _redact_secret_in_match
+
+    match = 'STRIPE = "sk_test_4Xk9mP2qL5nRjT8sYwZo3uC"'
+    secret = "sk_test_4Xk9mP2qL5nRjT8sYwZo3uC"
+    assert len(secret) == 31
+    out = _redact_secret_in_match(match, secret)
+    # Provider TEST prefix preserved
+    assert "sk_test_" in out
+    # Full secret never present
+    assert "4Xk9mP2qL5nRjT8sYwZo3uC" not in out
+    assert secret not in out
+    # Structural placeholder shape: 31 - 8 (prefix) = 23 remaining chars
+    assert "<SECRET prefix=sk_test_" in out
+    assert "+23" in out
+
+
+def test_redact_secret_short_secret_uses_smaller_prefix() -> None:
+    from appsec_crew.pipelines import _redact_secret_in_match
+
+    out = _redact_secret_in_match("k = 'abcdefgh'", "abcdefgh")  # 8 chars
+    assert "abcdefgh" not in out
+    # For < 12-char secrets prefix is at most n//2 = 4
+    assert "<SECRET prefix=abcd" in out
+
+
+def test_redact_secret_returns_match_unchanged_when_secret_missing() -> None:
+    from appsec_crew.pipelines import _redact_secret_in_match
+
+    assert _redact_secret_in_match("hello world", "") == "hello world"
+    assert _redact_secret_in_match("hello world", "not-in-string") == "hello world"
+
+
+def test_classify_secret_charset_categories() -> None:
+    from appsec_crew.pipelines import _classify_secret_charset
+
+    assert _classify_secret_charset("") == "empty"
+    assert _classify_secret_charset("12345") == "digits"
+    assert _classify_secret_charset("abcdef") == "hex"
+    assert _classify_secret_charset("ABCdef0123") == "hex"
+    assert _classify_secret_charset("hello") == "alpha"
+    assert _classify_secret_charset("abc123XYZ") == "alnum"
+    assert _classify_secret_charset("abc-123!") == "alnum-symbols"
+
+
+def test_secrets_triage_payload_redacts_match_and_invariants(monkeypatch) -> None:
+    """End-to-end privacy invariant:
+
+    1) The full Secret value MUST NOT appear ANYWHERE in the items list passed
+       to llm_triage_batch (this is what crosses the trust boundary).
+    2) The Match field is redacted with a structural placeholder.
+    3) Path is normalized to repo-relative for prompt efficiency.
+    """
+    from appsec_crew.pipelines import _triage_secrets_findings
+    from appsec_crew.settings import LlmAgentConfig, SecretsReviewerSettings
+
+    sr = SecretsReviewerSettings(
+        enabled=True,
+        llm=LlmAgentConfig(api_key="dummy-key"),
+        llm_triage_findings=True,
+    )
+    secret_value = "sk_live_4Xk9mP2qL5nRjT8sYwZo3uC"   # MUST NEVER LEAK
+    finding = {
+        "RuleID": "stripe-access-token",
+        "File": "/home/runner/work/o/r/app/config_insecure.py",
+        "StartLine": 12,
+        "Match": f'STRIPE = "{secret_value}"',
+        "Secret": secret_value,
+        "Fingerprint": "app/config_insecure.py:stripe-access-token:12",
+    }
+    captured = {}
+
+    def fake_triage(_cfg, *, agent_role, items, guidance, **_kw):
+        captured["agent_role"] = agent_role
+        captured["items"] = items
+        captured["guidance"] = guidance
+        return []
+
+    monkeypatch.setattr("appsec_crew.pipelines.llm_triage_batch", fake_triage)
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/home/runner/work/o/r")
+    _triage_secrets_findings(sr, [finding])
+
+    # Privacy invariant: the secret value cannot appear in any field of any item.
+    serialized = repr(captured["items"])
+    assert secret_value not in serialized, (
+        "PRIVACY VIOLATION: full secret leaked into LLM payload"
+    )
+
+    item = captured["items"][0]
+    assert item["rule_id"] == "stripe-access-token"
+    assert item["path"] == "app/config_insecure.py"   # workspace-stripped
+    assert item["line"] == 12
+    assert "<SECRET prefix=sk_live_" in item["match_redacted"]
+    assert item["fingerprint"].endswith(":stripe-access-token:12")
+
+    # Guidance must clearly tell the model to dismiss test prefixes and NOT
+    # dismiss live ones, plus reaffirm "never echo the secret".
+    g = captured["guidance"]
+    assert "sk_test_" in g and "AKIAEXAMPLE" in g
+    assert "DO NOT dismiss" in g
+    assert "never request the full secret value" in g.lower()
+
+
+def test_review_does_not_filter_when_pr_files_endpoint_fails() -> None:
+    """Graceful degradation: if list_pull_request_files errors, we skip the
+    filter entirely (no signal != 'every path is out-of-diff'). This avoids
+    silently dropping every comment when GitHub itself has a transient issue."""
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef"}}
+    gh.list_pull_request_files.side_effect = RuntimeError("502")
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/1#pullrequestreview-3"
+    }
+    findings = [
+        {
+            "check_id": "x",
+            "path": "any/file.py",
+            "start": {"line": 1},
+            "extra": {"message": "m", "severity": "ERROR"},
+        }
+    ]
+    url = _post_semgrep_pr_review(gh, 1, findings)
+    assert url is not None
+    payload = gh.create_pull_request_review.call_args.kwargs
+    assert len(payload["comments"]) == 1
+    assert payload["comments"][0]["path"] == "any/file.py"

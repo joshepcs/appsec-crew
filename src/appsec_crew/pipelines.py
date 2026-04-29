@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -32,11 +33,15 @@ from appsec_crew.settings import (
 )
 from appsec_crew.utils.cvss import max_cvss_score
 from appsec_crew.utils.filters import filter_osv_by_min_cvss, filter_semgrep_by_min_severity
+from appsec_crew.utils.logger import get_logger
 from appsec_crew.utils.severity import (
     cvss_floor_for_min_severity,
     human_severity_label,
     include_osv_vuln_without_cvss,
 )
+
+# Silent by default; set APPSEC_CREW_LOG_LEVEL=DEBUG to see per-review tracing.
+_review_log = get_logger("appsec_crew.review")
 
 
 def _git_remote_host() -> str:
@@ -46,13 +51,29 @@ def _git_remote_host() -> str:
 
 def _effective_betterleaks_scan_kind(ctx: RuntimeContext, configured: str) -> str:
     """
-    Use ``betterleaks git`` on ``workflow_dispatch`` and ``pull_request`` (full history).
+    Choose between ``betterleaks git`` (full commit-history scan) and
+    ``betterleaks dir`` (working-tree scan) based on the GitHub event.
 
-    Otherwise use the configured ``scan_kind`` from YAML (default ``git``; set ``dir`` for working-tree only).
+    ``pull_request``:
+        Use ``dir`` — scans the current working tree, which reflects exactly
+        the files changed by the PR. GitHub Actions creates a synthetic merge
+        commit (``refs/pull/N/merge``) as the checkout HEAD; ``betterleaks git``
+        traverses ``git log -p`` from that merge commit and may not reach the
+        feature-branch commits where secrets were introduced, causing false
+        negatives. ``dir`` is reliable because it always scans what is on disk.
+
+    ``workflow_dispatch`` / ``schedule`` / other batch events:
+        Use ``git`` — scans full commit history to catch secrets that were
+        committed and later removed (deleted from the tree but still in history).
+
+    The YAML ``scan_kind`` setting is respected for all non-pull_request events
+    that don't fall into the explicit overrides above.
     """
     event = (ctx.github_event_name or os.environ.get("GITHUB_EVENT_NAME") or "").strip()
-    if event in ("workflow_dispatch", "pull_request"):
-        return "git"
+    if event == "pull_request":
+        return "dir"   # working-tree scan — reliable for PR review context
+    if event == "workflow_dispatch":
+        return "git"   # full history scan for scheduled/manual batch runs
     return configured if configured in ("dir", "git") else "git"
 
 
@@ -159,14 +180,21 @@ def _format_osv_rows_for_issue(rows: list[dict[str, Any]], cvss_min: float, labe
         f"CVSS floor **{cvss_min}** when scored).\n",
         "Ignored packages / IDs: configure `osv-scanner.toml` in this repository.\n",
         "### Vulnerable package rows\n",
+        "| Package | Version | Ecosystem | Vulnerability IDs | Max CVSS |",
+        "|---------|---------|-----------|-------------------|----------|",
     ]
     for row in rows[:100]:
         pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
         name = pkg.get("name") or "?"
+        version = pkg.get("version") or "unknown"
         eco = pkg.get("ecosystem") or "?"
         vulns = [v for v in (row.get("vulnerabilities") or []) if isinstance(v, dict)][:20]
         vids = [str(v.get("id") or "?") for v in vulns]
-        lines.append(f"- **{name}** (`{eco}`): {', '.join(vids) if vids else '(no id)'}")
+        # Compute max CVSS across all vulnerabilities in this row
+        scores = [s for s in (max_cvss_score(v) for v in vulns) if s is not None]
+        cvss_display = f"{max(scores):.1f}" if scores else "n/a"
+        vid_str = ", ".join(vids) if vids else "(no id)"
+        lines.append(f"| **{name}** | `{version}` | {eco} | {vid_str} | {cvss_display} |")
     if len(rows) > 100:
         lines.append(f"\n… and **{len(rows) - 100}** more row(s).")
     return "\n".join(lines)
@@ -334,22 +362,45 @@ def _post_semgrep_pr_review(
     findings: list[dict[str, Any]],
 ) -> str | None:
     """Post a PR review with inline comments where possible; fall back to issue comment. Returns review URL or None."""
+    log = _review_log
     try:
         pr_data = gh.get_pull_request(pr_number)
         commit_id = (pr_data.get("head") or {}).get("sha")
         if not commit_id:
+            log.warning("semgrep-review: no head.sha; aborting")
             return None
-    except Exception:
+    except Exception as e:
+        log.error("semgrep-review: get_pull_request failed: %r", e)
         return None
+
+    # Filter inline comments to files in the PR diff. GitHub rejects the whole
+    # review (422 "Path could not be resolved") if even one comment's path is
+    # outside the PR — Semgrep scans the entire workspace, so it can flag files
+    # that exist on the branch but were not modified in this PR (e.g. a `secure.py`
+    # already present on `main`).
+    pr_paths = _pr_changed_paths(gh, pr_number)
+    if log.isEnabledFor(logging.DEBUG):
+        head = sorted(pr_paths)[:20]
+        suffix = f" (+{len(pr_paths) - 20} more)" if len(pr_paths) > 20 else ""
+        log.debug("semgrep-review: pr_changed_paths=%s%s", head, suffix)
 
     max_inline = 25
     curated = _semgrep_findings_curated_section(findings, max_items=25)
     comments: list[dict[str, Any]] = []
+    out_of_diff: list[tuple[str, int]] = []
     for f in findings[:max_inline]:
         raw_path = f.get("path")
         line = _semgrep_finding_line(f)
         rel = _semgrep_repo_relative_path(str(raw_path) if raw_path else "")
         if not rel or line is None:
+            log.debug(
+                "semgrep-review: skipping finding (no rel path or line): "
+                "raw_path=%r rel=%r line=%r",
+                raw_path, rel, line,
+            )
+            continue
+        if pr_paths and rel not in pr_paths:
+            out_of_diff.append((rel, line))
             continue
         comments.append(
             {
@@ -359,12 +410,48 @@ def _post_semgrep_pr_review(
             }
         )
 
-    body = (
-        "### AppSec Crew — Semgrep\n\n"
-        f"**{len(findings)}** finding(s) after severity filter and triage. "
-        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff (max {max_inline}).\n\n"
-        + curated
+    if out_of_diff:
+        log.info(
+            "semgrep-review: dropped %d inline comment(s) on files outside the PR diff: %s%s",
+            len(out_of_diff),
+            out_of_diff[:10],
+            f" (+{len(out_of_diff) - 10} more)" if len(out_of_diff) > 10 else "",
+        )
+
+    log.debug(
+        "semgrep-review: findings=%d inline_comments=%d out_of_diff=%d commit_id=%s",
+        len(findings), len(comments), len(out_of_diff), commit_id,
     )
+    if log.isEnabledFor(logging.DEBUG):
+        for i, c in enumerate(comments[:10], 1):
+            log.debug("semgrep-review:   #%d path=%s line=%s", i, c["path"], c["line"])
+
+    # GitHub's PR review body has a hard size cap (empirically ~65 KB). With many
+    # Semgrep findings the curated section can blow past it (each block is up
+    # to ~4 KB with the fix code fence). Solution: when we already have inline
+    # comments, the body is just the framing — Files tab inline comments cover
+    # the per-finding detail. Only embed the curated section as a fallback when
+    # no inline comment landed on a diff line.
+    framing_parts = [
+        "### AppSec Crew — Semgrep",
+        "",
+        f"**{len(findings)}** finding(s) after severity filter and triage. "
+        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff (max {max_inline}).",
+    ]
+    if out_of_diff:
+        framing_parts.append(
+            f"\n_**{len(out_of_diff)}** finding(s) live in files outside this PR's diff "
+            "(scanned by Semgrep but cannot be commented inline). See the workflow log "
+            "or batch-mode scheduled run to track them._"
+        )
+    framing = "\n".join(framing_parts)
+    if comments:
+        body = framing + (
+            "\n\nPer-finding detail (rule, severity, message, suggested fix) is on the Files tab."
+        )
+    else:
+        body = framing + "\n\n" + curated
+    log.debug("semgrep-review: body_len=%d", len(body))
     try:
         review = gh.create_pull_request_review(
             pr_number,
@@ -373,13 +460,51 @@ def _post_semgrep_pr_review(
             comments=comments if comments else None,
         )
         url = review.get("html_url")
+        log.debug(
+            "semgrep-review: OK url=%s review_keys=%s",
+            url,
+            sorted(review.keys()) if isinstance(review, dict) else "n/a",
+        )
         return str(url) if url else None
-    except Exception:
+    except Exception as e:
+        # Surface the GitHub response body when available — 422 errors include a
+        # structured `errors[]` array we want to see.
+        resp_body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                resp_body = resp.text[:2000]
+            except Exception:
+                resp_body = "(could not read response body)"
+        log.error(
+            "semgrep-review: create_pull_request_review FAILED: %r | response_body=%s",
+            e, resp_body,
+        )
         try:
             gh.create_pr_comment(pr_number, body)
-        except Exception:
-            pass
+            log.info("semgrep-review: fallback comment posted")
+        except Exception as e2:
+            log.error("semgrep-review: fallback ALSO failed: %r", e2)
         return None
+
+
+def _pr_changed_paths(gh: GitHubApi, pr_number: int) -> set[str]:
+    """Set of repo-relative file paths that are part of this PR's diff.
+
+    GitHub's PR review API rejects the *entire* review with
+    ``422 Path could not be resolved`` if any single inline comment's ``path``
+    is not in this set, so we use it to pre-filter findings before submitting.
+    Returns an empty set on API failure (caller should treat as "no filter").
+    """
+    try:
+        files = gh.list_pull_request_files(pr_number)
+    except Exception:
+        return set()
+    return {
+        str(f.get("filename") or "")
+        for f in files
+        if isinstance(f, dict) and f.get("filename")
+    }
 
 
 def _github_output_urls(agent: dict[str, Any]) -> list[str]:
@@ -388,27 +513,337 @@ def _github_output_urls(agent: dict[str, Any]) -> list[str]:
     for u in agent.get("issue_urls") or []:
         if u:
             out.append(str(u))
-    for key in ("pr_url", "semgrep_review_url"):
+    for key in ("pr_url", "semgrep_review_url", "betterleaks_review_url"):
         v = agent.get(key)
         if v:
             out.append(str(v))
     return out
 
 
+# ---------------------------------------------------------------------------
+# Betterleaks rendering — public, secret-safe views of findings.
+# Mirrors the Semgrep helpers above. The Secret / Match values from Betterleaks
+# JSON are NEVER included in any rendered output (PR comment, inline review,
+# state). The Fingerprint is `path:rule:line` and is safe to surface.
+# ---------------------------------------------------------------------------
+def _betterleaks_finding_safe_view(finding: dict[str, Any]) -> dict[str, Any]:
+    """Public, secret-safe view of a Betterleaks finding (no Match/Secret)."""
+    raw_path = finding.get("File") or finding.get("file") or ""
+    line_v = finding.get("StartLine") or finding.get("line")
+    end_v = finding.get("EndLine")
+    desc = (finding.get("Description") or "").strip()
+    return {
+        "rule_id": finding.get("RuleID") or finding.get("rule_id") or "?",
+        "path": _semgrep_repo_relative_path(str(raw_path)),
+        "line": int(line_v) if isinstance(line_v, int) else line_v,
+        "end_line": int(end_v) if isinstance(end_v, int) else end_v,
+        "description": desc,
+        "fingerprint": str(finding.get("Fingerprint") or ""),
+        "entropy": finding.get("Entropy"),
+    }
+
+
+def _betterleaks_findings_curated_section(
+    findings: list[dict[str, Any]], *, max_items: int = 25
+) -> str:
+    """Markdown table for the PR summary — never echoes Secret/Match values."""
+    if not findings:
+        return ""
+    rows: list[str] = [
+        "| # | File | Line | Rule | Description | Fingerprint |",
+        "|---|------|------|------|-------------|-------------|",
+    ]
+    for i, raw in enumerate(findings[:max_items], start=1):
+        v = _betterleaks_finding_safe_view(raw)
+        path = v["path"] or "(unknown)"
+        line = v["line"] if v["line"] is not None else "?"
+        desc = (v["description"] or "_No description._").replace("|", "\\|").replace("\n", " ")
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
+        fp = v["fingerprint"] or ""
+        if len(fp) > 80:
+            fp = fp[:77] + "..."
+        rows.append(
+            f"| {i} | `{path}` | {line} | `{v['rule_id']}` | {desc} | `{fp}` |"
+        )
+    out = "\n".join(rows)
+    if len(findings) > max_items:
+        out += (
+            f"\n\n_Showing **{max_items}** of **{len(findings)}** finding(s); "
+            "see the workflow log for the full JSON._"
+        )
+    out += (
+        "\n\n_Secret values are intentionally **not** included. "
+        "Rotate the credential, scrub it from git history (filter-repo / BFG), "
+        "and add the fingerprint to `.betterleaks.toml` only if the match is a confirmed false positive._"
+    )
+    return out
+
+
+def _betterleaks_inline_comment_body(finding: dict[str, Any]) -> str:
+    """Body for an inline PR review comment on the leak's line — secret is NOT echoed."""
+    v = _betterleaks_finding_safe_view(finding)
+    rid = v["rule_id"]
+    desc = v["description"] or "Potential hardcoded credential."
+    fp = v["fingerprint"]
+    lines = [
+        f"**Betterleaks** · `{rid}` · **secret leak**",
+        "",
+        desc,
+        "",
+        "**Action:** rotate the credential immediately, remove it from the working tree and from git history, "
+        "and load it from a secret manager / environment variable.",
+    ]
+    if fp:
+        lines.extend(
+            [
+                "",
+                "_Allowlist (only if false positive):_ add the fingerprint in `.betterleaks.toml`:",
+                "",
+                "```toml",
+                "[allowlist]",
+                f'fingerprints = ["{fp}"]',
+                "```",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _post_betterleaks_pr_review(
+    gh: GitHubApi,
+    pr_number: int,
+    findings: list[dict[str, Any]],
+) -> str | None:
+    """Post a PR review with inline comments per leak; fall back to issue comment. Returns review URL."""
+    log = _review_log
+    try:
+        pr_data = gh.get_pull_request(pr_number)
+        commit_id = (pr_data.get("head") or {}).get("sha")
+        if not commit_id:
+            log.warning("betterleaks-review: no head.sha; aborting")
+            return None
+    except Exception as e:
+        log.error("betterleaks-review: get_pull_request failed: %r", e)
+        return None
+
+    # Same diff-scoped filter as the Semgrep review: GitHub 422-rejects the whole
+    # batch if any inline comment's path isn't in the PR's modified files.
+    pr_paths = _pr_changed_paths(gh, pr_number)
+
+    max_inline = 25
+    curated = _betterleaks_findings_curated_section(findings, max_items=max_inline)
+    comments: list[dict[str, Any]] = []
+    out_of_diff: list[tuple[str, int]] = []
+    for f in findings[:max_inline]:
+        v = _betterleaks_finding_safe_view(f)
+        if not v["path"] or v["line"] is None:
+            log.debug(
+                "betterleaks-review: skipping finding (no path or line): path=%r line=%r",
+                v["path"], v["line"],
+            )
+            continue
+        try:
+            line_int = int(v["line"])
+        except (TypeError, ValueError):
+            continue
+        if pr_paths and v["path"] not in pr_paths:
+            out_of_diff.append((v["path"], line_int))
+            continue
+        comments.append(
+            {
+                "path": v["path"],
+                "line": line_int,
+                "body": _betterleaks_inline_comment_body(f),
+            }
+        )
+
+    if out_of_diff:
+        log.info(
+            "betterleaks-review: dropped %d inline comment(s) on files outside the PR diff: %s",
+            len(out_of_diff), out_of_diff[:10],
+        )
+
+    log.debug(
+        "betterleaks-review: findings=%d inline_comments=%d out_of_diff=%d commit_id=%s",
+        len(findings), len(comments), len(out_of_diff), commit_id,
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        for i, c in enumerate(comments[:10], 1):
+            log.debug("betterleaks-review:   #%d path=%s line=%s", i, c["path"], c["line"])
+
+    # Same body-size discipline as the Semgrep review: when inline comments
+    # carry the per-finding detail, the body stays short. Curated table is a
+    # fallback only when no inline comments could be anchored.
+    framing_parts = [
+        "### AppSec Crew — Betterleaks",
+        "",
+        f"**{len(findings)}** secret finding(s) after triage. "
+        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff "
+        f"(max {max_inline}). Secret values are not included in any comment.",
+    ]
+    if out_of_diff:
+        framing_parts.append(
+            f"\n_**{len(out_of_diff)}** finding(s) live in files outside this PR's diff "
+            "(scanned by Betterleaks but cannot be commented inline). Rotate the affected "
+            "credentials regardless and address them via a follow-up PR or scheduled batch run._"
+        )
+    framing = "\n".join(framing_parts)
+    if comments:
+        body = framing + (
+            "\n\nPer-finding detail (rule, description, fingerprint, allowlist hint) "
+            "is on the Files tab."
+        )
+    else:
+        body = framing + "\n\n" + curated
+    log.debug("betterleaks-review: body_len=%d", len(body))
+    try:
+        review = gh.create_pull_request_review(
+            pr_number,
+            commit_id=str(commit_id),
+            body=body,
+            comments=comments if comments else None,
+        )
+        url = review.get("html_url")
+        log.debug(
+            "betterleaks-review: OK url=%s review_keys=%s",
+            url,
+            sorted(review.keys()) if isinstance(review, dict) else "n/a",
+        )
+        return str(url) if url else None
+    except Exception as e:
+        resp_body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                resp_body = resp.text[:2000]
+            except Exception:
+                resp_body = "(could not read response body)"
+        log.error(
+            "betterleaks-review: create_pull_request_review FAILED: %r | response_body=%s",
+            e, resp_body,
+        )
+        try:
+            gh.create_pr_comment(pr_number, body)
+            log.info("betterleaks-review: fallback comment posted")
+        except Exception as e2:
+            log.error("betterleaks-review: fallback ALSO failed: %r", e2)
+        return None
+
+
+def _classify_secret_charset(s: str) -> str:
+    """Coarse charset class for a secret — used in triage redaction.
+
+    Helps the LLM recognize structural shapes (all-digits placeholders,
+    repeated alpha, hex digests) without seeing the value itself.
+
+    Order matters: ``hex`` is checked before ``alpha`` so MD5/SHA-style
+    digests (e.g. ``abcdef0123...``) are classified as ``hex`` rather than
+    falling through to the broader ``alpha``/``alnum`` buckets.
+    """
+    if not s:
+        return "empty"
+    if all(c.isdigit() for c in s):
+        return "digits"
+    if all(c in "0123456789abcdefABCDEF" for c in s):
+        return "hex"
+    if all(c.isalpha() for c in s):
+        return "alpha"
+    if all(c.isalnum() for c in s):
+        return "alnum"
+    return "alnum-symbols"
+
+
+def _redact_secret_in_match(match: str, secret: str) -> str:
+    """Replace ``secret`` in ``match`` with a structural placeholder.
+
+    The placeholder preserves the **prefix** (up to 8 chars) and the structural
+    metadata (remaining length, charset class). This is enough for the LLM to
+    recognize provider-marked test keys (``sk_test_``, ``pk_test_``, AWS docs
+    examples ``AKIAEXAMPLE…``, sequential/repeated patterns) WITHOUT the model
+    ever seeing the full credential value.
+
+    Examples::
+
+        match=`STRIPE = "sk_test_4Xk9mP2qL5nRjT8sYwZo3uC"`,
+        secret=`sk_test_4Xk9mP2qL5nRjT8sYwZo3uC`
+            -> `STRIPE = "<SECRET prefix=sk_test_ +24 alnum>"`
+
+        match=`AWS = "AKIAEXAMPLEXYZ12345"`, secret=`AKIAEXAMPLEXYZ12345`
+            -> `AWS = "<SECRET prefix=AKIAEXAM +11 alnum>"`
+
+    For very short secrets (< 12 chars) the visible prefix is reduced so the
+    leak ratio stays bounded. Returns ``match`` unchanged if ``secret`` is
+    empty or not found in ``match``.
+    """
+    if not secret or not match or secret not in match:
+        return match
+    n = len(secret)
+    # Cap prefix at 8 chars; halve for short secrets to bound the leak ratio.
+    prefix_len = 8 if n >= 12 else max(0, n // 2)
+    prefix = secret[:prefix_len]
+    rest = max(0, n - prefix_len)
+    charset = _classify_secret_charset(secret)
+    placeholder = f"<SECRET prefix={prefix} +{rest} {charset}>"
+    return match.replace(secret, placeholder)
+
+
 def _triage_secrets_findings(
     sr: SecretsReviewerSettings, findings: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not findings or not sr.llm_triage_findings or not sr.llm.api_key:
+    log = get_logger("appsec_crew.triage")
+    if not findings:
+        log.info("betterleaks-triage: 0 findings, skipping")
         return findings, []
+    if not sr.llm_triage_findings:
+        log.info("betterleaks-triage: disabled in YAML (tools.betterleaks.llm_triage=false), skipping %d finding(s)", len(findings))
+        return findings, []
+    if not sr.llm.api_key:
+        log.warning("betterleaks-triage: enabled but llm.api_key missing, skipping %d finding(s)", len(findings))
+        return findings, []
+    log.info("betterleaks-triage: calling LLM with %d finding(s) (model=%s)", len(findings), sr.llm.model)
     items = []
     for i, f in enumerate(findings):
         rid = f.get("RuleID") or f.get("rule_id") or "?"
-        path = f.get("File") or f.get("file") or "?"
+        raw_path = f.get("File") or f.get("file") or "?"
+        path = _semgrep_repo_relative_path(str(raw_path)) or str(raw_path)
         line = f.get("StartLine") or f.get("line") or "?"
-        items.append({"index": i, "rule_id": rid, "path": str(path), "line": line})
+        # Redacted match: enough shape for the LLM to spot test/example
+        # patterns (sk_test_*, AKIAEXAMPLE*, repeated/sequential strings,
+        # 'dummy'/'fake' substrings inside the prefix) without exfiltrating
+        # the credential value itself.
+        raw_match = str(f.get("Match") or f.get("match") or "")
+        secret = str(f.get("Secret") or f.get("secret") or "")
+        redacted = _redact_secret_in_match(raw_match, secret)
+        # Cap to keep prompt-token usage bounded.
+        if len(redacted) > 300:
+            redacted = redacted[:297] + "..."
+        items.append(
+            {
+                "index": i,
+                "rule_id": rid,
+                "path": path,
+                "line": line,
+                "match_redacted": redacted,
+                "fingerprint": str(f.get("Fingerprint") or ""),
+            }
+        )
     guidance = (
-        "Dismiss likely false positives: mocks/examples/placeholders, test fixtures, sample `.env` in docs, "
-        "strings clearly labeled fake, or paths that cannot hold production secrets."
+        "Triage Betterleaks (gitleaks-fork) findings. Each item shows a REDACTED "
+        "match where the secret value is replaced by `<SECRET prefix=... +N "
+        "charset=...>`. Use the prefix and structural shape — never the full "
+        "secret — to spot common false positives such as: "
+        "(a) provider-marked TEST keys: prefix `sk_test_`, `pk_test_`, "
+        "`AKIAEXAMPLE`, `AKIAIOSFODNN7EXAMPLE` (AWS docs example), repeating or "
+        "sequential charset classes (e.g. all `digits` of round count, or alpha "
+        "spelling out 'example'/'dummy'/'fake'); "
+        "(b) clearly-fake placeholders identifiable by the prefix tail "
+        "('dummy', 'fake', 'example', 'placeholder', 'changeme', 'xxxxxxx'); "
+        "(c) paths under tests/, examples/, docs/, or fixture-style directories. "
+        "Never echo the placeholder verbatim back, never request the full secret value. "
+        "DO NOT dismiss when the prefix indicates a live/production key "
+        "(`sk_live_`, `pk_live_`, `ghp_` followed by random alnum, `AKIA` "
+        "followed by random alnum NOT containing the substring EXAMPLE) and the "
+        "path is in production code (e.g. `app/`, `src/`, `lib/`)."
     )
     meta = llm_triage_batch(
         sr.llm,
@@ -416,14 +851,33 @@ def _triage_secrets_findings(
         items=items,
         guidance=guidance,
     )
+    log.info(
+        "betterleaks-triage: LLM returned %d dismissal(s) out of %d candidate(s)",
+        len(meta), len(items),
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        for d in meta[:10]:
+            log.debug(
+                "betterleaks-triage: dismissed index=%s reason=%s",
+                d.get("index"), d.get("reason", "")[:200],
+            )
     return partition_by_dismiss_indices(findings, meta)
 
 
 def _triage_osv_rows(
     dr: DependenciesReviewerSettings, rows: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not rows or not dr.llm_triage_findings or not dr.llm.api_key:
+    log = get_logger("appsec_crew.triage")
+    if not rows:
+        log.info("osv-triage: 0 rows, skipping")
         return rows, []
+    if not dr.llm_triage_findings:
+        log.info("osv-triage: disabled in YAML (tools.osv_scanner.llm_triage=false), skipping %d row(s)", len(rows))
+        return rows, []
+    if not dr.llm.api_key:
+        log.warning("osv-triage: enabled but llm.api_key missing, skipping %d row(s)", len(rows))
+        return rows, []
+    log.info("osv-triage: calling LLM with %d row(s) (model=%s)", len(rows), dr.llm.model)
     items = []
     for i, row in enumerate(rows):
         pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
@@ -447,28 +901,75 @@ def _triage_osv_rows(
         items=items,
         guidance=guidance,
     )
+    log.info(
+        "osv-triage: LLM returned %d dismissal(s) out of %d candidate(s)",
+        len(meta), len(items),
+    )
     return partition_by_dismiss_indices(rows, meta)
 
 
 def _triage_semgrep_findings(
     cr: CodeReviewerSettings, findings: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not findings or not cr.llm_triage_findings or not cr.llm.api_key:
+    log = get_logger("appsec_crew.triage")
+    if not findings:
+        log.info("semgrep-triage: 0 findings, skipping")
         return findings, []
+    if not cr.llm_triage_findings:
+        log.info("semgrep-triage: disabled in YAML (tools.semgrep.llm_triage=false), skipping %d finding(s)", len(findings))
+        return findings, []
+    if not cr.llm.api_key:
+        log.warning("semgrep-triage: enabled but llm.api_key missing, skipping %d finding(s)", len(findings))
+        return findings, []
+    log.info("semgrep-triage: calling LLM with %d finding(s) (model=%s)", len(findings), cr.llm.model)
     items = []
     for i, f in enumerate(findings):
         extra = f.get("extra") if isinstance(f.get("extra"), dict) else {}
+        # Code snippet — Semgrep emits the matched lines in extra.lines; this is
+        # the single biggest signal for FP triage. Without it the LLM has to
+        # decide on rule_id + path + generic rule message, which is far too
+        # little info for production-path findings (e.g. MD5 in a cache helper).
+        snippet = str(extra.get("lines") or "")
+        if len(snippet) > 600:
+            snippet = snippet[:597] + "..."
+        # CWE & severity from rule metadata help the LLM weigh impact.
+        meta_block = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+        cwe = meta_block.get("cwe")
+        if isinstance(cwe, list):
+            cwe = ", ".join(str(c) for c in cwe[:4]) if cwe else None
+        elif isinstance(cwe, str):
+            cwe = cwe.strip() or None
+        else:
+            cwe = None
+        rel_path = _semgrep_repo_relative_path(str(f.get("path") or ""))
+        line = _semgrep_finding_line(f)
         items.append(
             {
                 "index": i,
                 "check_id": f.get("check_id"),
-                "path": f.get("path"),
+                "path": rel_path or f.get("path"),
+                "line": line,
+                "severity": _semgrep_finding_severity(f),
+                "cwe": cwe,
                 "message": str(extra.get("message") or "")[:450],
+                "snippet": snippet,
+                "has_suggested_fix": bool(_semgrep_finding_fix(extra)),
             }
         )
     guidance = (
-        "Dismiss likely false positives: test-only code, dead branches, benign patterns, framework boilerplate, "
-        "or findings inconsistent with how the application actually uses the flagged code."
+        "Triage Semgrep findings using the snippet AND surrounding context. "
+        "Dismiss likely false positives such as: "
+        "(a) benign-but-flagged patterns where the rule matches syntactically but "
+        "the actual usage in the snippet shows the impact does not apply (e.g. "
+        "MD5 used for non-security purposes like ETag/cache key/dedup, NOT for "
+        "passwords or signed tokens; subprocess.run(shell=True) with a hardcoded "
+        "constant string and no user input; eval() on a Python literal; "
+        "assert isinstance() in tests where -O is never used); "
+        "(b) test-only code, dead branches, framework boilerplate; "
+        "(c) findings inconsistent with how the snippet shows the value flowing. "
+        "DO NOT dismiss when the snippet shows user-controlled input flowing into "
+        "the dangerous sink, when the path looks like auth/crypto/session code, or "
+        "when the rule message names a CVE/CWE that matches the snippet's pattern."
     )
     meta = llm_triage_batch(
         cr.llm,
@@ -476,6 +977,16 @@ def _triage_semgrep_findings(
         items=items,
         guidance=guidance,
     )
+    log.info(
+        "semgrep-triage: LLM returned %d dismissal(s) out of %d candidate(s)",
+        len(meta), len(items),
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        for d in meta[:10]:
+            log.debug(
+                "semgrep-triage: dismissed index=%s reason=%s",
+                d.get("index"), d.get("reason", "")[:200],
+            )
     return partition_by_dismiss_indices(findings, meta)
 
 
@@ -561,15 +1072,20 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
     issues_reused = 0
     if gh and findings and not pr_mode:
         for f in findings:
-            rid = f.get("RuleID") or f.get("rule_id") or "unknown-rule"
-            path = f.get("File") or f.get("file") or "?"
-            line = f.get("StartLine") or f.get("line") or "?"
+            v = _betterleaks_finding_safe_view(f)
+            rid = v["rule_id"] or "unknown-rule"
+            path = v["path"] or "?"
+            line = v["line"] if v["line"] is not None else "?"
+            desc = v["description"] or "Hardcoded credential detected."
+            fp = v["fingerprint"]
             title = f"[AppSec] Secret finding: {rid}"
             body = (
                 "Automated report from **AppSec Crew** (Betterleaks).\n\n"
                 f"- **Rule**: `{rid}`\n"
                 f"- **Location**: `{path}` line {line}\n"
-                "- Secret value is **not** included in this issue.\n"
+                f"- **Description**: {desc}\n"
+                + (f"- **Fingerprint**: `{fp}`\n" if fp else "")
+                + "- Secret value is **not** included in this issue.\n"
                 "- Ignore paths / allowlists: configure `.betterleaks.toml` / `.gitleaks.toml` in this repository.\n"
             )
             iss, created = gh.create_issue_deduped(title, body, labels=["security", "appsec-crew"])
@@ -580,6 +1096,8 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
             url = iss.get("html_url", "")
             if url and url not in issue_urls:
                 issue_urls.append(url)
+    findings_pub = [_betterleaks_finding_safe_view(f) for f in findings]
+    findings_md = _betterleaks_findings_curated_section(findings)
     ctx.state["secrets_reviewer"] = {
         "betterleaks_scan_kind_used": scan_kind,
         "commands_executed": commands,
@@ -589,10 +1107,23 @@ def run_secrets_pipeline(ctx: RuntimeContext) -> str:
         "findings_after_triage": len(findings),
         "dismissed_findings": dismissed_pub,
         "findings_total": len(findings),
+        "findings": findings_pub,
+        "findings_markdown": findings_md,
+        "betterleaks_review_url": None,
         "github_issues_created_new": issues_new,
         "github_issues_reused_existing": issues_reused,
         "executed": True,
     }
+    # PR mode: post an inline review on the leaks' lines (no secret echoed).
+    if (
+        findings
+        and pr_mode
+        and ctx.pr_number is not None
+        and gh is not None
+        and getattr(sr, "betterleaks_pr_inline_comments", True)
+    ):
+        review_url = _post_betterleaks_pr_review(gh, ctx.pr_number, findings)
+        ctx.state["secrets_reviewer"]["betterleaks_review_url"] = review_url
     return json.dumps(ctx.state["secrets_reviewer"], indent=2)
 
 
@@ -630,11 +1161,32 @@ def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
     after_cvss = len(rows)
     rows, dismissed_raw = _triage_osv_rows(dr, rows)
     dismissed_pub = _public_osv_dismissals(dismissed_raw)
+    # Build a structured summary of vulnerable packages for use in PR comments and reporter state.
+    # This runs regardless of PR vs batch mode so the reporter agent always has package details.
+    vulnerable_packages = []
+    for row in rows[:50]:
+        pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
+        name = pkg.get("name") or "?"
+        version = pkg.get("version") or "unknown"
+        eco = pkg.get("ecosystem") or "?"
+        vulns = [v for v in (row.get("vulnerabilities") or []) if isinstance(v, dict)][:10]
+        vids = [str(v.get("id") or "?") for v in vulns]
+        scores = [s for s in (max_cvss_score(v) for v in vulns) if s is not None]
+        cvss_display = f"{max(scores):.1f}" if scores else "n/a"
+        vulnerable_packages.append({
+            "name": name,
+            "version": version,
+            "ecosystem": eco,
+            "vulnerability_ids": vids,
+            "max_cvss": cvss_display,
+        })
+
     ctx.state["dependencies_reviewer"] = {
         "vulnerable_rows": len(rows),
         "scanner_rows_after_cvss": after_cvss,
         "dismissed_findings": dismissed_pub,
         "commands_executed": commands,
+        "vulnerable_packages": vulnerable_packages,   # package-level detail for reporter/PR comment
         "pr_url": None,
         "issue_urls": [],
         "github_issue_reused_existing": False,
@@ -649,9 +1201,27 @@ def run_dependencies_pipeline(ctx: RuntimeContext) -> str:
         ctx.state["dependencies_reviewer"]["error"] = "No GitHub token/repo; skipped GitHub output."
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
-    if _is_pr_scan_mode(ctx):
+    if _is_pr_scan_mode(ctx) and ctx.pr_number is not None:
+        label = human_severity_label(min_lvl)
+        # Post a dedicated PR comment with the full package table (mirrors the Issue body format).
+        pr_body = _format_osv_rows_for_issue(rows, cvss_min, label)
+        pr_body = (
+            f"## 📦 Dependency Scan — OSV-Scanner ({len(rows)} vulnerable package row(s))\n\n"
+            + pr_body
+            + "\n\n> Configure ignores in `osv-scanner.toml`. "
+            "Severity threshold: `global.min_severity` in `appsec_crew.yaml`."
+        )
+        gh.create_pr_comment(ctx.pr_number, pr_body)
+        ctx.state["dependencies_reviewer"]["pr_scan_mode"] = True
         ctx.state["dependencies_reviewer"]["note"] = (
-            "PR scan mode: dependency findings are only in the PR summary comment (no GitHub Issue)."
+            "PR scan mode: OSV findings posted as PR comment (no GitHub Issue)."
+        )
+        return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
+
+    if _is_pr_scan_mode(ctx):
+        # PR mode but no PR number resolved — store data only, no comment possible.
+        ctx.state["dependencies_reviewer"]["note"] = (
+            "PR scan mode: dependency findings available in state (PR number not resolved)."
         )
         return json.dumps(ctx.state["dependencies_reviewer"], indent=2)
 
@@ -827,6 +1397,7 @@ def _markdown_report_pr_scan(ctx: RuntimeContext) -> str:
         "",
     ]
     sr = ctx.state.get("secrets_reviewer") or {}
+    secrets_detail_md = ""
     if s.secrets_reviewer.enabled and sr.get("executed") and not sr.get("skipped"):
         n = int(sr.get("findings_after_triage", sr.get("findings_total", 0)) or 0)
         raw = sr.get("scanner_findings_total", "n/a")
@@ -835,6 +1406,13 @@ def _markdown_report_pr_scan(ctx: RuntimeContext) -> str:
         lines.append(
             f"- **Betterleaks:** {n} finding(s) after triage (scanner raw: **{raw}**){bl_suffix}."
         )
+        bl_url = sr.get("betterleaks_review_url")
+        if bl_url:
+            lines.append(
+                f"  - [Betterleaks PR review]({bl_url}) — **rule, file, line, and description** "
+                "(inline comments on the diff; secret values never included)."
+            )
+        secrets_detail_md = (sr.get("findings_markdown") or "").strip()
     dr = ctx.state.get("dependencies_reviewer") or {}
     if s.dependencies_reviewer.enabled and dr.get("executed") and not dr.get("skipped"):
         lines.append(f"- **OSV-Scanner:** **{dr.get('vulnerable_rows', 0)}** vulnerable row(s) after CVSS filter + triage.")
@@ -852,6 +1430,8 @@ def _markdown_report_pr_scan(ctx: RuntimeContext) -> str:
         fm = (cr.get("findings_markdown") or "").strip()
         if fm and not cr.get("semgrep_review_url"):
             lines.extend(["", "### Semgrep — detail", "", fm])
+    if secrets_detail_md and not sr.get("betterleaks_review_url"):
+        lines.extend(["", "### Betterleaks — detail", "", secrets_detail_md])
     lines.extend(
         [
             "",
