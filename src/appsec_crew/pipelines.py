@@ -401,12 +401,24 @@ def _post_semgrep_pr_review(
             file=sys.stderr,
         )
 
-    body = (
+    # GitHub's PR review body has a hard size cap (empirically ~65 KB). With many
+    # Semgrep findings the curated section can blow past it (each block is up
+    # to ~4 KB with the fix code fence). Solution: when we already have inline
+    # comments, the body is just the framing — Files tab inline comments cover
+    # the per-finding detail. Only embed the curated section as a fallback when
+    # no inline comment landed on a diff line.
+    framing = (
         "### AppSec Crew — Semgrep\n\n"
         f"**{len(findings)}** finding(s) after severity filter and triage. "
-        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff (max {max_inline}).\n\n"
-        + curated
+        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff (max {max_inline})."
     )
+    if comments:
+        body = framing + (
+            "\n\nPer-finding detail (rule, severity, message, suggested fix) is on the Files tab."
+        )
+    else:
+        body = framing + "\n\n" + curated
+    print(f"[appsec-crew][semgrep-review] body_len={len(body)}", file=sys.stderr)
     try:
         review = gh.create_pull_request_review(
             pr_number,
@@ -422,9 +434,18 @@ def _post_semgrep_pr_review(
         )
         return str(url) if url else None
     except Exception as e:
+        # Surface the GitHub response body when available — 422 errors include a
+        # structured `errors[]` array we want to see.
+        resp_body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                resp_body = resp.text[:2000]
+            except Exception:
+                resp_body = "(could not read response body)"
         print(
-            f"[appsec-crew][semgrep-review] create_pull_request_review FAILED: {e!r} — "
-            "falling back to plain PR comment",
+            f"[appsec-crew][semgrep-review] create_pull_request_review FAILED: {e!r}\n"
+            f"[appsec-crew][semgrep-review] response_body={resp_body}",
             file=sys.stderr,
         )
         try:
@@ -589,13 +610,23 @@ def _post_betterleaks_pr_review(
             file=sys.stderr,
         )
 
-    body = (
+    # Same body-size discipline as the Semgrep review: when inline comments
+    # carry the per-finding detail, the body stays short. Curated table is a
+    # fallback only when no inline comments could be anchored.
+    framing = (
         "### AppSec Crew — Betterleaks\n\n"
         f"**{len(findings)}** secret finding(s) after triage. "
         f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff "
-        f"(max {max_inline}). Secret values are not included in any comment.\n\n"
-        + curated
+        f"(max {max_inline}). Secret values are not included in any comment."
     )
+    if comments:
+        body = framing + (
+            "\n\nPer-finding detail (rule, description, fingerprint, allowlist hint) "
+            "is on the Files tab."
+        )
+    else:
+        body = framing + "\n\n" + curated
+    print(f"[appsec-crew][betterleaks-review] body_len={len(body)}", file=sys.stderr)
     try:
         review = gh.create_pull_request_review(
             pr_number,
@@ -611,9 +642,16 @@ def _post_betterleaks_pr_review(
         )
         return str(url) if url else None
     except Exception as e:
+        resp_body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                resp_body = resp.text[:2000]
+            except Exception:
+                resp_body = "(could not read response body)"
         print(
-            f"[appsec-crew][betterleaks-review] create_pull_request_review FAILED: {e!r} — "
-            "falling back to plain PR comment",
+            f"[appsec-crew][betterleaks-review] create_pull_request_review FAILED: {e!r}\n"
+            f"[appsec-crew][betterleaks-review] response_body={resp_body}",
             file=sys.stderr,
         )
         try:

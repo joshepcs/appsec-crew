@@ -281,8 +281,19 @@ def test_code_pr_mode_review_not_autofix_pr(tmp_path: Path, monkeypatch) -> None
     mock_gh.create_issue_deduped.assert_not_called()
     mock_gh.create_pull_request_review.assert_called_once()
     assert ctx.state["code_reviewer"]["semgrep_review_url"] == "https://github.com/o/r/pull/8#pullrequestreview-1"
-    body = mock_gh.create_pull_request_review.call_args.kwargs["body"]
-    assert "**Why:**" in body or "unsafe" in body
+    # When inline comments are present, the review body stays short to avoid GitHub's
+    # ~64 KB review-body limit. The per-finding detail (including `**Why:**`) lives
+    # inside each inline comment instead.
+    call_kwargs = mock_gh.create_pull_request_review.call_args.kwargs
+    body = call_kwargs["body"]
+    assert "AppSec Crew — Semgrep" in body
+    assert "**1** finding(s)" in body
+    inline_comments = call_kwargs["comments"]
+    assert isinstance(inline_comments, list) and len(inline_comments) == 1
+    inline_body = inline_comments[0]["body"]
+    assert "**Why:**" in inline_body or "unsafe" in inline_body
+    # findings_markdown remains in state so the reporter can render the table when
+    # the inline review is unavailable (e.g., review API rejects the request).
     assert "findings_markdown" in ctx.state["code_reviewer"]
     assert "app.py:4" in ctx.state["code_reviewer"]["findings_markdown"]
 
