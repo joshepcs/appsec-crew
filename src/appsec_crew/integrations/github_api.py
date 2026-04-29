@@ -116,6 +116,36 @@ class GitHubApi:
         r.raise_for_status()
         return r.json()
 
+    def list_pull_request_files(self, pr_number: int) -> list[dict[str, Any]]:
+        """List files changed in a PR (paginated). Returns all pages combined.
+
+        Each entry has at least: ``filename``, ``status``, ``additions``,
+        ``deletions``, ``changes``, and (for in-tree updates) ``patch``.
+
+        Used by review-posting paths to filter inline comments to files that
+        are actually part of the PR diff — GitHub rejects the entire review
+        with ``422 Path could not be resolved`` if any single comment points
+        at a file outside the PR.
+        """
+        out: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            r = httpx.get(
+                self._url(f"/repos/{self.owner}/{self.repo}/pulls/{pr_number}/files"),
+                headers=self._headers,
+                params={"per_page": 100, "page": page},
+                timeout=60.0,
+            )
+            r.raise_for_status()
+            chunk = r.json()
+            if not isinstance(chunk, list) or not chunk:
+                break
+            out.extend(c for c in chunk if isinstance(c, dict))
+            if len(chunk) < 100:
+                break
+            page += 1
+        return out
+
     def create_pull_request_review(
         self,
         pr_number: int,

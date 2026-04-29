@@ -11,6 +11,9 @@ from appsec_crew.pipelines import (
     _effective_betterleaks_scan_kind,
     _github_output_urls,
     _is_pr_scan_mode,
+    _post_betterleaks_pr_review,
+    _post_semgrep_pr_review,
+    _pr_changed_paths,
     pr_scan_actionable_findings_counts,
     pr_scan_has_actionable_findings,
     pr_scan_summary_for_ci,
@@ -539,3 +542,148 @@ def test_secrets_workflow_dispatch_passes_git_to_betterleaks(tmp_path: Path, mon
     run_secrets_pipeline(ctx)
     assert captured["scan_kind"] == "git"
     assert ctx.state["secrets_reviewer"]["betterleaks_scan_kind_used"] == "git"
+
+
+# ---------------------------------------------------------------------------
+# PR-diff filtering: GitHub rejects the entire review (422 "Path could not be
+# resolved") if any inline comment points to a file outside the PR diff.
+# Both Semgrep and Betterleaks reviews must pre-filter findings to in-diff
+# paths only, and surface the dropped count in the review body.
+# ---------------------------------------------------------------------------
+def test_pr_changed_paths_returns_set_of_filenames() -> None:
+    gh = MagicMock()
+    gh.list_pull_request_files.return_value = [
+        {"filename": "app/insecure.py", "status": "added"},
+        {"filename": "app/cache_utils.py", "status": "added"},
+        {"filename": "tests/test_x.py", "status": "added"},
+    ]
+    assert _pr_changed_paths(gh, 1) == {
+        "app/insecure.py",
+        "app/cache_utils.py",
+        "tests/test_x.py",
+    }
+
+
+def test_pr_changed_paths_empty_on_api_error() -> None:
+    gh = MagicMock()
+    gh.list_pull_request_files.side_effect = RuntimeError("network down")
+    assert _pr_changed_paths(gh, 1) == set()
+
+
+def test_semgrep_review_drops_inline_comments_outside_pr_diff() -> None:
+    """Reproduces the 422 'Path could not be resolved' the user hit: Semgrep
+    flags a file (`app/secure.py`) that exists on the branch but is unchanged
+    by this PR. The inline comment for that file MUST be dropped, and the
+    review payload submitted to GitHub MUST contain only in-diff paths."""
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef"}}
+    gh.list_pull_request_files.return_value = [
+        {"filename": "app/insecure.py", "status": "added"},
+        {"filename": "app/cache_utils.py", "status": "added"},
+    ]
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/1#pullrequestreview-1"
+    }
+
+    findings = [
+        {  # IN diff — should become an inline comment
+            "check_id": "python.lang.security.audit.use-of-md5",
+            "path": "app/cache_utils.py",
+            "start": {"line": 35},
+            "extra": {"message": "MD5 used", "severity": "WARNING"},
+        },
+        {  # IN diff — should become an inline comment
+            "check_id": "python.lang.security.audit.subprocess-shell-true",
+            "path": "app/insecure.py",
+            "start": {"line": 12},
+            "extra": {"message": "shell=True", "severity": "ERROR"},
+        },
+        {  # OUT of diff — must NOT be sent as inline comment
+            "check_id": "python.lang.security.audit.dangerous-system-call",
+            "path": "app/secure.py",
+            "start": {"line": 7},
+            "extra": {"message": "os.system", "severity": "WARNING"},
+        },
+    ]
+
+    url = _post_semgrep_pr_review(gh, 1, findings)
+    assert url == "https://github.com/o/r/pull/1#pullrequestreview-1"
+
+    payload = gh.create_pull_request_review.call_args.kwargs
+    submitted = payload["comments"]
+    submitted_paths = {c["path"] for c in submitted}
+    assert submitted_paths == {"app/cache_utils.py", "app/insecure.py"}
+    assert "app/secure.py" not in submitted_paths
+
+    # Body should mention that one finding lives outside the diff so the user
+    # doesn't lose visibility on it.
+    body = payload["body"]
+    assert "1** finding(s) live in files outside" in body
+    assert "**3** finding(s) after severity filter" in body
+    assert "**2** inline comment(s)" in body
+
+
+def test_betterleaks_review_drops_inline_comments_outside_pr_diff() -> None:
+    """Same diff-scoped filter applies to Betterleaks PR reviews."""
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef"}}
+    gh.list_pull_request_files.return_value = [
+        {"filename": "app/config_insecure.py", "status": "added"},
+    ]
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/1#pullrequestreview-2"
+    }
+
+    findings = [
+        {  # IN diff
+            "RuleID": "stripe-access-token",
+            "Description": "Stripe key",
+            "StartLine": 12,
+            "File": "app/config_insecure.py",
+            "Fingerprint": "app/config_insecure.py:stripe-access-token:12",
+        },
+        {  # OUT of diff — must NOT be sent inline
+            "RuleID": "github-pat",
+            "Description": "GitHub PAT",
+            "StartLine": 3,
+            "File": "scripts/legacy.py",
+            "Fingerprint": "scripts/legacy.py:github-pat:3",
+        },
+    ]
+
+    url = _post_betterleaks_pr_review(gh, 1, findings)
+    assert url == "https://github.com/o/r/pull/1#pullrequestreview-2"
+
+    payload = gh.create_pull_request_review.call_args.kwargs
+    submitted_paths = {c["path"] for c in payload["comments"]}
+    assert submitted_paths == {"app/config_insecure.py"}
+    assert "scripts/legacy.py" not in submitted_paths
+
+    body = payload["body"]
+    assert "1** finding(s) live in files outside" in body
+    assert "Rotate the affected credentials regardless" in body
+
+
+def test_review_does_not_filter_when_pr_files_endpoint_fails() -> None:
+    """Graceful degradation: if list_pull_request_files errors, we skip the
+    filter entirely (no signal != 'every path is out-of-diff'). This avoids
+    silently dropping every comment when GitHub itself has a transient issue."""
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef"}}
+    gh.list_pull_request_files.side_effect = RuntimeError("502")
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/1#pullrequestreview-3"
+    }
+    findings = [
+        {
+            "check_id": "x",
+            "path": "any/file.py",
+            "start": {"line": 1},
+            "extra": {"message": "m", "severity": "ERROR"},
+        }
+    ]
+    url = _post_semgrep_pr_review(gh, 1, findings)
+    assert url is not None
+    payload = gh.create_pull_request_review.call_args.kwargs
+    assert len(payload["comments"]) == 1
+    assert payload["comments"][0]["path"] == "any/file.py"

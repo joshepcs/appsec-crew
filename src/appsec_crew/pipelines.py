@@ -368,9 +368,22 @@ def _post_semgrep_pr_review(
         print(f"[appsec-crew][semgrep-review] get_pull_request failed: {e!r}", file=sys.stderr)
         return None
 
+    # Filter inline comments to files in the PR diff. GitHub rejects the whole
+    # review (422 "Path could not be resolved") if even one comment's path is
+    # outside the PR — Semgrep scans the entire workspace, so it can flag files
+    # that exist on the branch but were not modified in this PR (e.g. a `secure.py`
+    # already present on `main`).
+    pr_paths = _pr_changed_paths(gh, pr_number)
+    print(
+        f"[appsec-crew][semgrep-review] pr_changed_paths={sorted(pr_paths)[:20]}"
+        + (f" (+{len(pr_paths) - 20} more)" if len(pr_paths) > 20 else ""),
+        file=sys.stderr,
+    )
+
     max_inline = 25
     curated = _semgrep_findings_curated_section(findings, max_items=25)
     comments: list[dict[str, Any]] = []
+    out_of_diff: list[tuple[str, int]] = []
     for f in findings[:max_inline]:
         raw_path = f.get("path")
         line = _semgrep_finding_line(f)
@@ -382,6 +395,9 @@ def _post_semgrep_pr_review(
                 file=sys.stderr,
             )
             continue
+        if pr_paths and rel not in pr_paths:
+            out_of_diff.append((rel, line))
+            continue
         comments.append(
             {
                 "path": rel,
@@ -390,9 +406,17 @@ def _post_semgrep_pr_review(
             }
         )
 
+    if out_of_diff:
+        print(
+            f"[appsec-crew][semgrep-review] dropped {len(out_of_diff)} inline comment(s) "
+            f"on files outside the PR diff: {out_of_diff[:10]}"
+            + (f" (+{len(out_of_diff) - 10} more)" if len(out_of_diff) > 10 else ""),
+            file=sys.stderr,
+        )
+
     print(
         f"[appsec-crew][semgrep-review] findings={len(findings)} "
-        f"inline_comments={len(comments)} commit_id={commit_id}",
+        f"inline_comments={len(comments)} out_of_diff={len(out_of_diff)} commit_id={commit_id}",
         file=sys.stderr,
     )
     for i, c in enumerate(comments[:10], 1):
@@ -407,11 +431,19 @@ def _post_semgrep_pr_review(
     # comments, the body is just the framing — Files tab inline comments cover
     # the per-finding detail. Only embed the curated section as a fallback when
     # no inline comment landed on a diff line.
-    framing = (
-        "### AppSec Crew — Semgrep\n\n"
+    framing_parts = [
+        "### AppSec Crew — Semgrep",
+        "",
         f"**{len(findings)}** finding(s) after severity filter and triage. "
-        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff (max {max_inline})."
-    )
+        f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff (max {max_inline}).",
+    ]
+    if out_of_diff:
+        framing_parts.append(
+            f"\n_**{len(out_of_diff)}** finding(s) live in files outside this PR's diff "
+            "(scanned by Semgrep but cannot be commented inline). See the workflow log "
+            "or batch-mode scheduled run to track them._"
+        )
+    framing = "\n".join(framing_parts)
     if comments:
         body = framing + (
             "\n\nPer-finding detail (rule, severity, message, suggested fix) is on the Files tab."
@@ -454,6 +486,25 @@ def _post_semgrep_pr_review(
         except Exception as e2:
             print(f"[appsec-crew][semgrep-review] fallback ALSO failed: {e2!r}", file=sys.stderr)
         return None
+
+
+def _pr_changed_paths(gh: GitHubApi, pr_number: int) -> set[str]:
+    """Set of repo-relative file paths that are part of this PR's diff.
+
+    GitHub's PR review API rejects the *entire* review with
+    ``422 Path could not be resolved`` if any single inline comment's ``path``
+    is not in this set, so we use it to pre-filter findings before submitting.
+    Returns an empty set on API failure (caller should treat as "no filter").
+    """
+    try:
+        files = gh.list_pull_request_files(pr_number)
+    except Exception:
+        return set()
+    return {
+        str(f.get("filename") or "")
+        for f in files
+        if isinstance(f, dict) and f.get("filename")
+    }
 
 
 def _github_output_urls(agent: dict[str, Any]) -> list[str]:
@@ -575,9 +626,14 @@ def _post_betterleaks_pr_review(
         print(f"[appsec-crew][betterleaks-review] get_pull_request failed: {e!r}", file=sys.stderr)
         return None
 
+    # Same diff-scoped filter as the Semgrep review: GitHub 422-rejects the whole
+    # batch if any inline comment's path isn't in the PR's modified files.
+    pr_paths = _pr_changed_paths(gh, pr_number)
+
     max_inline = 25
     curated = _betterleaks_findings_curated_section(findings, max_items=max_inline)
     comments: list[dict[str, Any]] = []
+    out_of_diff: list[tuple[str, int]] = []
     for f in findings[:max_inline]:
         v = _betterleaks_finding_safe_view(f)
         if not v["path"] or v["line"] is None:
@@ -591,6 +647,9 @@ def _post_betterleaks_pr_review(
             line_int = int(v["line"])
         except (TypeError, ValueError):
             continue
+        if pr_paths and v["path"] not in pr_paths:
+            out_of_diff.append((v["path"], line_int))
+            continue
         comments.append(
             {
                 "path": v["path"],
@@ -599,9 +658,16 @@ def _post_betterleaks_pr_review(
             }
         )
 
+    if out_of_diff:
+        print(
+            f"[appsec-crew][betterleaks-review] dropped {len(out_of_diff)} inline comment(s) "
+            f"on files outside the PR diff: {out_of_diff[:10]}",
+            file=sys.stderr,
+        )
+
     print(
         f"[appsec-crew][betterleaks-review] findings={len(findings)} "
-        f"inline_comments={len(comments)} commit_id={commit_id}",
+        f"inline_comments={len(comments)} out_of_diff={len(out_of_diff)} commit_id={commit_id}",
         file=sys.stderr,
     )
     for i, c in enumerate(comments[:10], 1):
@@ -613,12 +679,20 @@ def _post_betterleaks_pr_review(
     # Same body-size discipline as the Semgrep review: when inline comments
     # carry the per-finding detail, the body stays short. Curated table is a
     # fallback only when no inline comments could be anchored.
-    framing = (
-        "### AppSec Crew — Betterleaks\n\n"
+    framing_parts = [
+        "### AppSec Crew — Betterleaks",
+        "",
         f"**{len(findings)}** secret finding(s) after triage. "
         f"**{len(comments)}** inline comment(s) on lines that are part of this PR diff "
-        f"(max {max_inline}). Secret values are not included in any comment."
-    )
+        f"(max {max_inline}). Secret values are not included in any comment.",
+    ]
+    if out_of_diff:
+        framing_parts.append(
+            f"\n_**{len(out_of_diff)}** finding(s) live in files outside this PR's diff "
+            "(scanned by Betterleaks but cannot be commented inline). Rotate the affected "
+            "credentials regardless and address them via a follow-up PR or scheduled batch run._"
+        )
+    framing = "\n".join(framing_parts)
     if comments:
         body = framing + (
             "\n\nPer-finding detail (rule, description, fingerprint, allowlist hint) "
