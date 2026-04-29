@@ -1,4 +1,27 @@
-"""Optional OpenAI-compatible LLM pass to flag likely false positives before acting on scanner output."""
+"""Optional LLM pass to flag likely false positives before acting on scanner output.
+
+Routing
+-------
+
+The triage call goes through **LiteLLM** (a transitive dependency of CrewAI),
+the same dispatch path the main agents use via :mod:`appsec_crew.utils.llm`.
+This means the YAML config is honored consistently:
+
+* ``model: gpt-*`` → OpenAI (default).
+* ``model: claude-*`` → auto-prefixed to ``anthropic/...`` and dispatched to
+  the Anthropic API with the right schema (``/v1/messages`` + ``x-api-key``).
+* ``model: gemini-*`` → Google Gemini.
+* ``model: github/*`` (already prefixed) → passes through; LiteLLM dispatches
+  to GitHub Models.
+* ``base_url`` is honored verbatim for OpenAI-compatible endpoints (Azure
+  OpenAI, vLLM, OpenRouter, GH Models, etc.).
+
+Before this change the triage spoke raw OpenAI ``/v1/chat/completions``
+unconditionally — Anthropic-keyed runs got 401 silently, the empty result
+was caught and turned into "0 dismissals", and triage looked like it ran but
+never actually changed anything. The fix is exactly the same routing the
+agents already use, just lifted into this module.
+"""
 
 from __future__ import annotations
 
@@ -6,16 +29,17 @@ import json
 import re
 from typing import Any
 
-import httpx
-
 from appsec_crew.settings import LlmAgentConfig
+from appsec_crew.utils.llm_routing import resolve_model_for_litellm
 
-
-def _chat_completions_url(base_url: str | None) -> str:
-    b = (base_url or "https://api.openai.com/v1").rstrip("/")
-    if b.endswith("/v1"):
-        return f"{b}/chat/completions"
-    return f"{b}/v1/chat/completions"
+# LiteLLM ships as a transitive dep of CrewAI (>= 1.10). Lazy import lets the
+# module fail gracefully (return [] from llm_triage_batch) if it is somehow
+# absent, instead of breaking module import for callers that never trigger
+# triage (llm_triage opt-in).
+try:
+    from litellm import completion as _litellm_completion
+except ImportError:  # pragma: no cover
+    _litellm_completion = None  # type: ignore[assignment]
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -46,15 +70,19 @@ def llm_triage_batch(
     guidance: str,
     timeout_s: float = 120.0,
 ) -> list[dict[str, Any]]:
-    """
-    Ask the LLM which item indices are likely false positives.
+    """Ask the configured LLM which item indices are likely false positives.
 
-    Returns a list of dicts: {"index": int, "reason": str} (only dismissed items).
-    On any failure, returns [] (caller keeps all findings).
+    Returns a list of dicts: ``[{"index": <int>, "reason": "<short>"}, ...]``
+    (only dismissed items). On any failure — bad credentials, network error,
+    malformed response, parse failure — returns ``[]`` so the caller keeps
+    every finding (fail-open is the safe default for a security scanner).
     """
     if not cfg.api_key or not items:
         return []
-    url = _chat_completions_url(cfg.base_url)
+    if _litellm_completion is None:
+        return []
+
+    model = resolve_model_for_litellm(cfg.model, cfg.base_url, cfg.provider)
     system = (
         f"You are {agent_role}. Review scanner candidates and mark likely false positives only. "
         "Never request or invent secret values. Respond with JSON only."
@@ -67,22 +95,27 @@ def llm_triage_batch(
         "Use empty dismiss if none apply."
     )
     try:
-        r = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"},
-            json={
-                "model": cfg.model,
-                "temperature": min(cfg.temperature, 0.3),
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            },
-            timeout=timeout_s,
-        )
-        r.raise_for_status()
-        data = r.json()
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "api_key": cfg.api_key,
+            "temperature": min(cfg.temperature, 0.3),
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "timeout": timeout_s,
+        }
+        if cfg.base_url:
+            kwargs["base_url"] = cfg.base_url
+        response = _litellm_completion(**kwargs)
+        # LiteLLM normalizes responses to the OpenAI shape across providers.
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return []
+        message = getattr(choices[0], "message", None)
+        content = (getattr(message, "content", None) or "") if message else ""
+        if not isinstance(content, str):
+            return []
         parsed = _extract_json_object(content)
         if not parsed:
             return []
@@ -97,7 +130,7 @@ def llm_triage_batch(
             reason = str(row.get("reason") or "dismissed by triage")[:500]
             out.append({"index": idx, "reason": reason})
         return out
-    except (httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+    except Exception:
         return []
 
 
