@@ -357,12 +357,15 @@ def _post_semgrep_pr_review(
     findings: list[dict[str, Any]],
 ) -> str | None:
     """Post a PR review with inline comments where possible; fall back to issue comment. Returns review URL or None."""
+    import sys
     try:
         pr_data = gh.get_pull_request(pr_number)
         commit_id = (pr_data.get("head") or {}).get("sha")
         if not commit_id:
+            print("[appsec-crew][semgrep-review] no head.sha; aborting", file=sys.stderr)
             return None
-    except Exception:
+    except Exception as e:
+        print(f"[appsec-crew][semgrep-review] get_pull_request failed: {e!r}", file=sys.stderr)
         return None
 
     max_inline = 25
@@ -373,6 +376,11 @@ def _post_semgrep_pr_review(
         line = _semgrep_finding_line(f)
         rel = _semgrep_repo_relative_path(str(raw_path) if raw_path else "")
         if not rel or line is None:
+            print(
+                f"[appsec-crew][semgrep-review] skipping finding (no rel path or line): "
+                f"raw_path={raw_path!r} rel={rel!r} line={line!r}",
+                file=sys.stderr,
+            )
             continue
         comments.append(
             {
@@ -380,6 +388,17 @@ def _post_semgrep_pr_review(
                 "line": line,
                 "body": _semgrep_inline_comment_body(f),
             }
+        )
+
+    print(
+        f"[appsec-crew][semgrep-review] findings={len(findings)} "
+        f"inline_comments={len(comments)} commit_id={commit_id}",
+        file=sys.stderr,
+    )
+    for i, c in enumerate(comments[:10], 1):
+        print(
+            f"[appsec-crew][semgrep-review]   #{i} path={c['path']} line={c['line']}",
+            file=sys.stderr,
         )
 
     body = (
@@ -396,12 +415,23 @@ def _post_semgrep_pr_review(
             comments=comments if comments else None,
         )
         url = review.get("html_url")
+        print(
+            f"[appsec-crew][semgrep-review] OK url={url} "
+            f"review_keys={sorted(review.keys()) if isinstance(review, dict) else 'n/a'}",
+            file=sys.stderr,
+        )
         return str(url) if url else None
-    except Exception:
+    except Exception as e:
+        print(
+            f"[appsec-crew][semgrep-review] create_pull_request_review FAILED: {e!r} — "
+            "falling back to plain PR comment",
+            file=sys.stderr,
+        )
         try:
             gh.create_pr_comment(pr_number, body)
-        except Exception:
-            pass
+            print("[appsec-crew][semgrep-review] fallback comment posted", file=sys.stderr)
+        except Exception as e2:
+            print(f"[appsec-crew][semgrep-review] fallback ALSO failed: {e2!r}", file=sys.stderr)
         return None
 
 
@@ -513,12 +543,15 @@ def _post_betterleaks_pr_review(
     findings: list[dict[str, Any]],
 ) -> str | None:
     """Post a PR review with inline comments per leak; fall back to issue comment. Returns review URL."""
+    import sys
     try:
         pr_data = gh.get_pull_request(pr_number)
         commit_id = (pr_data.get("head") or {}).get("sha")
         if not commit_id:
+            print("[appsec-crew][betterleaks-review] no head.sha; aborting", file=sys.stderr)
             return None
-    except Exception:
+    except Exception as e:
+        print(f"[appsec-crew][betterleaks-review] get_pull_request failed: {e!r}", file=sys.stderr)
         return None
 
     max_inline = 25
@@ -527,6 +560,11 @@ def _post_betterleaks_pr_review(
     for f in findings[:max_inline]:
         v = _betterleaks_finding_safe_view(f)
         if not v["path"] or v["line"] is None:
+            print(
+                f"[appsec-crew][betterleaks-review] skipping finding (no path or line): "
+                f"path={v['path']!r} line={v['line']!r}",
+                file=sys.stderr,
+            )
             continue
         try:
             line_int = int(v["line"])
@@ -538,6 +576,17 @@ def _post_betterleaks_pr_review(
                 "line": line_int,
                 "body": _betterleaks_inline_comment_body(f),
             }
+        )
+
+    print(
+        f"[appsec-crew][betterleaks-review] findings={len(findings)} "
+        f"inline_comments={len(comments)} commit_id={commit_id}",
+        file=sys.stderr,
+    )
+    for i, c in enumerate(comments[:10], 1):
+        print(
+            f"[appsec-crew][betterleaks-review]   #{i} path={c['path']} line={c['line']}",
+            file=sys.stderr,
         )
 
     body = (
@@ -555,12 +604,23 @@ def _post_betterleaks_pr_review(
             comments=comments if comments else None,
         )
         url = review.get("html_url")
+        print(
+            f"[appsec-crew][betterleaks-review] OK url={url} "
+            f"review_keys={sorted(review.keys()) if isinstance(review, dict) else 'n/a'}",
+            file=sys.stderr,
+        )
         return str(url) if url else None
-    except Exception:
+    except Exception as e:
+        print(
+            f"[appsec-crew][betterleaks-review] create_pull_request_review FAILED: {e!r} — "
+            "falling back to plain PR comment",
+            file=sys.stderr,
+        )
         try:
             gh.create_pr_comment(pr_number, body)
-        except Exception:
-            pass
+            print("[appsec-crew][betterleaks-review] fallback comment posted", file=sys.stderr)
+        except Exception as e2:
+            print(f"[appsec-crew][betterleaks-review] fallback ALSO failed: {e2!r}", file=sys.stderr)
         return None
 
 
