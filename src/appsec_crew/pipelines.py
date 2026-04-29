@@ -790,8 +790,17 @@ def _redact_secret_in_match(match: str, secret: str) -> str:
 def _triage_secrets_findings(
     sr: SecretsReviewerSettings, findings: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not findings or not sr.llm_triage_findings or not sr.llm.api_key:
+    log = get_logger("appsec_crew.triage")
+    if not findings:
+        log.info("betterleaks-triage: 0 findings, skipping")
         return findings, []
+    if not sr.llm_triage_findings:
+        log.info("betterleaks-triage: disabled in YAML (tools.betterleaks.llm_triage=false), skipping %d finding(s)", len(findings))
+        return findings, []
+    if not sr.llm.api_key:
+        log.warning("betterleaks-triage: enabled but llm.api_key missing, skipping %d finding(s)", len(findings))
+        return findings, []
+    log.info("betterleaks-triage: calling LLM with %d finding(s) (model=%s)", len(findings), sr.llm.model)
     items = []
     for i, f in enumerate(findings):
         rid = f.get("RuleID") or f.get("rule_id") or "?"
@@ -842,14 +851,33 @@ def _triage_secrets_findings(
         items=items,
         guidance=guidance,
     )
+    log.info(
+        "betterleaks-triage: LLM returned %d dismissal(s) out of %d candidate(s)",
+        len(meta), len(items),
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        for d in meta[:10]:
+            log.debug(
+                "betterleaks-triage: dismissed index=%s reason=%s",
+                d.get("index"), d.get("reason", "")[:200],
+            )
     return partition_by_dismiss_indices(findings, meta)
 
 
 def _triage_osv_rows(
     dr: DependenciesReviewerSettings, rows: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not rows or not dr.llm_triage_findings or not dr.llm.api_key:
+    log = get_logger("appsec_crew.triage")
+    if not rows:
+        log.info("osv-triage: 0 rows, skipping")
         return rows, []
+    if not dr.llm_triage_findings:
+        log.info("osv-triage: disabled in YAML (tools.osv_scanner.llm_triage=false), skipping %d row(s)", len(rows))
+        return rows, []
+    if not dr.llm.api_key:
+        log.warning("osv-triage: enabled but llm.api_key missing, skipping %d row(s)", len(rows))
+        return rows, []
+    log.info("osv-triage: calling LLM with %d row(s) (model=%s)", len(rows), dr.llm.model)
     items = []
     for i, row in enumerate(rows):
         pkg = row.get("package") if isinstance(row.get("package"), dict) else {}
@@ -873,14 +901,27 @@ def _triage_osv_rows(
         items=items,
         guidance=guidance,
     )
+    log.info(
+        "osv-triage: LLM returned %d dismissal(s) out of %d candidate(s)",
+        len(meta), len(items),
+    )
     return partition_by_dismiss_indices(rows, meta)
 
 
 def _triage_semgrep_findings(
     cr: CodeReviewerSettings, findings: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not findings or not cr.llm_triage_findings or not cr.llm.api_key:
+    log = get_logger("appsec_crew.triage")
+    if not findings:
+        log.info("semgrep-triage: 0 findings, skipping")
         return findings, []
+    if not cr.llm_triage_findings:
+        log.info("semgrep-triage: disabled in YAML (tools.semgrep.llm_triage=false), skipping %d finding(s)", len(findings))
+        return findings, []
+    if not cr.llm.api_key:
+        log.warning("semgrep-triage: enabled but llm.api_key missing, skipping %d finding(s)", len(findings))
+        return findings, []
+    log.info("semgrep-triage: calling LLM with %d finding(s) (model=%s)", len(findings), cr.llm.model)
     items = []
     for i, f in enumerate(findings):
         extra = f.get("extra") if isinstance(f.get("extra"), dict) else {}
@@ -936,6 +977,16 @@ def _triage_semgrep_findings(
         items=items,
         guidance=guidance,
     )
+    log.info(
+        "semgrep-triage: LLM returned %d dismissal(s) out of %d candidate(s)",
+        len(meta), len(items),
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        for d in meta[:10]:
+            log.debug(
+                "semgrep-triage: dismissed index=%s reason=%s",
+                d.get("index"), d.get("reason", "")[:200],
+            )
     return partition_by_dismiss_indices(findings, meta)
 
 
