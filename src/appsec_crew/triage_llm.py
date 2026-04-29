@@ -31,6 +31,9 @@ from typing import Any
 
 from appsec_crew.settings import LlmAgentConfig
 from appsec_crew.utils.llm_routing import resolve_model_for_litellm
+from appsec_crew.utils.logger import get_logger
+
+_log = get_logger("appsec_crew.triage")
 
 # LiteLLM ships as a transitive dep of CrewAI (>= 1.10). Lazy import lets the
 # module fail gracefully (return [] from llm_triage_batch) if it is somehow
@@ -38,8 +41,10 @@ from appsec_crew.utils.llm_routing import resolve_model_for_litellm
 # triage (llm_triage opt-in).
 try:
     from litellm import completion as _litellm_completion
-except ImportError:  # pragma: no cover
+    _LITELLM_IMPORT_ERROR: str | None = None
+except ImportError as _e:  # pragma: no cover
     _litellm_completion = None  # type: ignore[assignment]
+    _LITELLM_IMPORT_ERROR = repr(_e)
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -80,9 +85,19 @@ def llm_triage_batch(
     if not cfg.api_key or not items:
         return []
     if _litellm_completion is None:
+        _log.error(
+            "triage: LiteLLM not importable, skipping triage for %d item(s). "
+            "ImportError was: %s",
+            len(items),
+            _LITELLM_IMPORT_ERROR,
+        )
         return []
 
     model = resolve_model_for_litellm(cfg.model, cfg.base_url, cfg.provider)
+    _log.debug(
+        "triage: dispatching via LiteLLM model=%s base_url=%s provider=%s",
+        model, cfg.base_url, cfg.provider,
+    )
     system = (
         f"You are {agent_role}. Review scanner candidates and mark likely false positives only. "
         "Never request or invent secret values. Respond with JSON only."
@@ -130,7 +145,26 @@ def llm_triage_batch(
             reason = str(row.get("reason") or "dismissed by triage")[:500]
             out.append({"index": idx, "reason": reason})
         return out
-    except Exception:
+    except Exception as e:
+        # Surface the failure so triage no longer silently 'returns 0 dismissals'
+        # when the call itself broke. We still fail-open (return []) so the
+        # security scanner never drops findings on a bad LLM call — but the log
+        # now tells you why it dropped to 0.
+        resp_body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                resp_body = (resp.text if hasattr(resp, "text") else str(resp))[:2000]
+            except Exception:
+                resp_body = "(could not read response body)"
+        _log.error(
+            "triage: LLM call failed (model=%s base_url=%s): %s: %s%s",
+            model,
+            cfg.base_url,
+            type(e).__name__,
+            str(e)[:500],
+            f" | response_body={resp_body}" if resp_body else "",
+        )
         return []
 
 
