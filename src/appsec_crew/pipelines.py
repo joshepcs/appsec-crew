@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -32,11 +33,15 @@ from appsec_crew.settings import (
 )
 from appsec_crew.utils.cvss import max_cvss_score
 from appsec_crew.utils.filters import filter_osv_by_min_cvss, filter_semgrep_by_min_severity
+from appsec_crew.utils.logger import get_logger
 from appsec_crew.utils.severity import (
     cvss_floor_for_min_severity,
     human_severity_label,
     include_osv_vuln_without_cvss,
 )
+
+# Silent by default; set APPSEC_CREW_LOG_LEVEL=DEBUG to see per-review tracing.
+_review_log = get_logger("appsec_crew.review")
 
 
 def _git_remote_host() -> str:
@@ -357,15 +362,15 @@ def _post_semgrep_pr_review(
     findings: list[dict[str, Any]],
 ) -> str | None:
     """Post a PR review with inline comments where possible; fall back to issue comment. Returns review URL or None."""
-    import sys
+    log = _review_log
     try:
         pr_data = gh.get_pull_request(pr_number)
         commit_id = (pr_data.get("head") or {}).get("sha")
         if not commit_id:
-            print("[appsec-crew][semgrep-review] no head.sha; aborting", file=sys.stderr)
+            log.warning("semgrep-review: no head.sha; aborting")
             return None
     except Exception as e:
-        print(f"[appsec-crew][semgrep-review] get_pull_request failed: {e!r}", file=sys.stderr)
+        log.error("semgrep-review: get_pull_request failed: %r", e)
         return None
 
     # Filter inline comments to files in the PR diff. GitHub rejects the whole
@@ -374,11 +379,10 @@ def _post_semgrep_pr_review(
     # that exist on the branch but were not modified in this PR (e.g. a `secure.py`
     # already present on `main`).
     pr_paths = _pr_changed_paths(gh, pr_number)
-    print(
-        f"[appsec-crew][semgrep-review] pr_changed_paths={sorted(pr_paths)[:20]}"
-        + (f" (+{len(pr_paths) - 20} more)" if len(pr_paths) > 20 else ""),
-        file=sys.stderr,
-    )
+    if log.isEnabledFor(logging.DEBUG):
+        head = sorted(pr_paths)[:20]
+        suffix = f" (+{len(pr_paths) - 20} more)" if len(pr_paths) > 20 else ""
+        log.debug("semgrep-review: pr_changed_paths=%s%s", head, suffix)
 
     max_inline = 25
     curated = _semgrep_findings_curated_section(findings, max_items=25)
@@ -389,10 +393,10 @@ def _post_semgrep_pr_review(
         line = _semgrep_finding_line(f)
         rel = _semgrep_repo_relative_path(str(raw_path) if raw_path else "")
         if not rel or line is None:
-            print(
-                f"[appsec-crew][semgrep-review] skipping finding (no rel path or line): "
-                f"raw_path={raw_path!r} rel={rel!r} line={line!r}",
-                file=sys.stderr,
+            log.debug(
+                "semgrep-review: skipping finding (no rel path or line): "
+                "raw_path=%r rel=%r line=%r",
+                raw_path, rel, line,
             )
             continue
         if pr_paths and rel not in pr_paths:
@@ -407,23 +411,20 @@ def _post_semgrep_pr_review(
         )
 
     if out_of_diff:
-        print(
-            f"[appsec-crew][semgrep-review] dropped {len(out_of_diff)} inline comment(s) "
-            f"on files outside the PR diff: {out_of_diff[:10]}"
-            + (f" (+{len(out_of_diff) - 10} more)" if len(out_of_diff) > 10 else ""),
-            file=sys.stderr,
+        log.info(
+            "semgrep-review: dropped %d inline comment(s) on files outside the PR diff: %s%s",
+            len(out_of_diff),
+            out_of_diff[:10],
+            f" (+{len(out_of_diff) - 10} more)" if len(out_of_diff) > 10 else "",
         )
 
-    print(
-        f"[appsec-crew][semgrep-review] findings={len(findings)} "
-        f"inline_comments={len(comments)} out_of_diff={len(out_of_diff)} commit_id={commit_id}",
-        file=sys.stderr,
+    log.debug(
+        "semgrep-review: findings=%d inline_comments=%d out_of_diff=%d commit_id=%s",
+        len(findings), len(comments), len(out_of_diff), commit_id,
     )
-    for i, c in enumerate(comments[:10], 1):
-        print(
-            f"[appsec-crew][semgrep-review]   #{i} path={c['path']} line={c['line']}",
-            file=sys.stderr,
-        )
+    if log.isEnabledFor(logging.DEBUG):
+        for i, c in enumerate(comments[:10], 1):
+            log.debug("semgrep-review:   #%d path=%s line=%s", i, c["path"], c["line"])
 
     # GitHub's PR review body has a hard size cap (empirically ~65 KB). With many
     # Semgrep findings the curated section can blow past it (each block is up
@@ -450,7 +451,7 @@ def _post_semgrep_pr_review(
         )
     else:
         body = framing + "\n\n" + curated
-    print(f"[appsec-crew][semgrep-review] body_len={len(body)}", file=sys.stderr)
+    log.debug("semgrep-review: body_len=%d", len(body))
     try:
         review = gh.create_pull_request_review(
             pr_number,
@@ -459,10 +460,10 @@ def _post_semgrep_pr_review(
             comments=comments if comments else None,
         )
         url = review.get("html_url")
-        print(
-            f"[appsec-crew][semgrep-review] OK url={url} "
-            f"review_keys={sorted(review.keys()) if isinstance(review, dict) else 'n/a'}",
-            file=sys.stderr,
+        log.debug(
+            "semgrep-review: OK url=%s review_keys=%s",
+            url,
+            sorted(review.keys()) if isinstance(review, dict) else "n/a",
         )
         return str(url) if url else None
     except Exception as e:
@@ -475,16 +476,15 @@ def _post_semgrep_pr_review(
                 resp_body = resp.text[:2000]
             except Exception:
                 resp_body = "(could not read response body)"
-        print(
-            f"[appsec-crew][semgrep-review] create_pull_request_review FAILED: {e!r}\n"
-            f"[appsec-crew][semgrep-review] response_body={resp_body}",
-            file=sys.stderr,
+        log.error(
+            "semgrep-review: create_pull_request_review FAILED: %r | response_body=%s",
+            e, resp_body,
         )
         try:
             gh.create_pr_comment(pr_number, body)
-            print("[appsec-crew][semgrep-review] fallback comment posted", file=sys.stderr)
+            log.info("semgrep-review: fallback comment posted")
         except Exception as e2:
-            print(f"[appsec-crew][semgrep-review] fallback ALSO failed: {e2!r}", file=sys.stderr)
+            log.error("semgrep-review: fallback ALSO failed: %r", e2)
         return None
 
 
@@ -615,15 +615,15 @@ def _post_betterleaks_pr_review(
     findings: list[dict[str, Any]],
 ) -> str | None:
     """Post a PR review with inline comments per leak; fall back to issue comment. Returns review URL."""
-    import sys
+    log = _review_log
     try:
         pr_data = gh.get_pull_request(pr_number)
         commit_id = (pr_data.get("head") or {}).get("sha")
         if not commit_id:
-            print("[appsec-crew][betterleaks-review] no head.sha; aborting", file=sys.stderr)
+            log.warning("betterleaks-review: no head.sha; aborting")
             return None
     except Exception as e:
-        print(f"[appsec-crew][betterleaks-review] get_pull_request failed: {e!r}", file=sys.stderr)
+        log.error("betterleaks-review: get_pull_request failed: %r", e)
         return None
 
     # Same diff-scoped filter as the Semgrep review: GitHub 422-rejects the whole
@@ -637,10 +637,9 @@ def _post_betterleaks_pr_review(
     for f in findings[:max_inline]:
         v = _betterleaks_finding_safe_view(f)
         if not v["path"] or v["line"] is None:
-            print(
-                f"[appsec-crew][betterleaks-review] skipping finding (no path or line): "
-                f"path={v['path']!r} line={v['line']!r}",
-                file=sys.stderr,
+            log.debug(
+                "betterleaks-review: skipping finding (no path or line): path=%r line=%r",
+                v["path"], v["line"],
             )
             continue
         try:
@@ -659,22 +658,18 @@ def _post_betterleaks_pr_review(
         )
 
     if out_of_diff:
-        print(
-            f"[appsec-crew][betterleaks-review] dropped {len(out_of_diff)} inline comment(s) "
-            f"on files outside the PR diff: {out_of_diff[:10]}",
-            file=sys.stderr,
+        log.info(
+            "betterleaks-review: dropped %d inline comment(s) on files outside the PR diff: %s",
+            len(out_of_diff), out_of_diff[:10],
         )
 
-    print(
-        f"[appsec-crew][betterleaks-review] findings={len(findings)} "
-        f"inline_comments={len(comments)} out_of_diff={len(out_of_diff)} commit_id={commit_id}",
-        file=sys.stderr,
+    log.debug(
+        "betterleaks-review: findings=%d inline_comments=%d out_of_diff=%d commit_id=%s",
+        len(findings), len(comments), len(out_of_diff), commit_id,
     )
-    for i, c in enumerate(comments[:10], 1):
-        print(
-            f"[appsec-crew][betterleaks-review]   #{i} path={c['path']} line={c['line']}",
-            file=sys.stderr,
-        )
+    if log.isEnabledFor(logging.DEBUG):
+        for i, c in enumerate(comments[:10], 1):
+            log.debug("betterleaks-review:   #%d path=%s line=%s", i, c["path"], c["line"])
 
     # Same body-size discipline as the Semgrep review: when inline comments
     # carry the per-finding detail, the body stays short. Curated table is a
@@ -700,7 +695,7 @@ def _post_betterleaks_pr_review(
         )
     else:
         body = framing + "\n\n" + curated
-    print(f"[appsec-crew][betterleaks-review] body_len={len(body)}", file=sys.stderr)
+    log.debug("betterleaks-review: body_len=%d", len(body))
     try:
         review = gh.create_pull_request_review(
             pr_number,
@@ -709,10 +704,10 @@ def _post_betterleaks_pr_review(
             comments=comments if comments else None,
         )
         url = review.get("html_url")
-        print(
-            f"[appsec-crew][betterleaks-review] OK url={url} "
-            f"review_keys={sorted(review.keys()) if isinstance(review, dict) else 'n/a'}",
-            file=sys.stderr,
+        log.debug(
+            "betterleaks-review: OK url=%s review_keys=%s",
+            url,
+            sorted(review.keys()) if isinstance(review, dict) else "n/a",
         )
         return str(url) if url else None
     except Exception as e:
@@ -723,16 +718,15 @@ def _post_betterleaks_pr_review(
                 resp_body = resp.text[:2000]
             except Exception:
                 resp_body = "(could not read response body)"
-        print(
-            f"[appsec-crew][betterleaks-review] create_pull_request_review FAILED: {e!r}\n"
-            f"[appsec-crew][betterleaks-review] response_body={resp_body}",
-            file=sys.stderr,
+        log.error(
+            "betterleaks-review: create_pull_request_review FAILED: %r | response_body=%s",
+            e, resp_body,
         )
         try:
             gh.create_pr_comment(pr_number, body)
-            print("[appsec-crew][betterleaks-review] fallback comment posted", file=sys.stderr)
+            log.info("betterleaks-review: fallback comment posted")
         except Exception as e2:
-            print(f"[appsec-crew][betterleaks-review] fallback ALSO failed: {e2!r}", file=sys.stderr)
+            log.error("betterleaks-review: fallback ALSO failed: %r", e2)
         return None
 
 
