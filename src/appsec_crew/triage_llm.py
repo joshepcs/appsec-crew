@@ -3,24 +3,28 @@
 Routing
 -------
 
-The triage call goes through **LiteLLM** (a transitive dependency of CrewAI),
-the same dispatch path the main agents use via :mod:`appsec_crew.utils.llm`.
-This means the YAML config is honored consistently:
+The triage call goes through ``crewai.LLM`` — the same dispatch path the
+main agents use via :mod:`appsec_crew.utils.llm`. This is critical because:
+
+* CrewAI 1.10+ does NOT bundle LiteLLM as a transitive dependency (it ships
+  ``openai`` and ``anthropic`` directly as native providers). A previous
+  iteration of this module called ``litellm.completion`` directly and broke
+  in CI when LiteLLM wasn't installed (``ModuleNotFoundError: No module
+  named 'litellm'``).
+* Reusing ``crewai.LLM`` means the agent and the triage share one code path,
+  one set of credentials, one model-resolution policy. Whatever works for
+  the agent works for triage.
+
+Routing rules honored (same as :func:`appsec_crew.utils.llm.build_llm`):
 
 * ``model: gpt-*`` → OpenAI (default).
-* ``model: claude-*`` → auto-prefixed to ``anthropic/...`` and dispatched to
-  the Anthropic API with the right schema (``/v1/messages`` + ``x-api-key``).
+* ``model: claude-*`` → auto-prefixed to ``anthropic/...`` so CrewAI's native
+  dispatcher picks the Anthropic provider (without the prefix it falls
+  through to OpenAI and 401s on an Anthropic key — see commit cb80285).
 * ``model: gemini-*`` → Google Gemini.
-* ``model: github/*`` (already prefixed) → passes through; LiteLLM dispatches
-  to GitHub Models.
-* ``base_url`` is honored verbatim for OpenAI-compatible endpoints (Azure
-  OpenAI, vLLM, OpenRouter, GH Models, etc.).
-
-Before this change the triage spoke raw OpenAI ``/v1/chat/completions``
-unconditionally — Anthropic-keyed runs got 401 silently, the empty result
-was caught and turned into "0 dismissals", and triage looked like it ran but
-never actually changed anything. The fix is exactly the same routing the
-agents already use, just lifted into this module.
+* ``model: github/*`` (already prefixed) → passes through.
+* ``base_url`` is honored for OpenAI-compatible endpoints (Azure, vLLM,
+  GH Models, etc.).
 """
 
 from __future__ import annotations
@@ -35,16 +39,16 @@ from appsec_crew.utils.logger import get_logger
 
 _log = get_logger("appsec_crew.triage")
 
-# LiteLLM ships as a transitive dep of CrewAI (>= 1.10). Lazy import lets the
-# module fail gracefully (return [] from llm_triage_batch) if it is somehow
-# absent, instead of breaking module import for callers that never trigger
-# triage (llm_triage opt-in).
+# CrewAI is a hard dep of this package (declared in pyproject.toml). The lazy
+# import + ImportError capture mirrors the rest of the codebase's defensive
+# pattern: the triage module stays importable even in stripped-down test
+# environments that don't have crewai installed (utils.llm_routing tests).
 try:
-    from litellm import completion as _litellm_completion
-    _LITELLM_IMPORT_ERROR: str | None = None
+    from crewai import LLM as _CrewAILLM
+    _CREWAI_IMPORT_ERROR: str | None = None
 except ImportError as _e:  # pragma: no cover
-    _litellm_completion = None  # type: ignore[assignment]
-    _LITELLM_IMPORT_ERROR = repr(_e)
+    _CrewAILLM = None  # type: ignore[assignment]
+    _CREWAI_IMPORT_ERROR = repr(_e)
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -84,18 +88,18 @@ def llm_triage_batch(
     """
     if not cfg.api_key or not items:
         return []
-    if _litellm_completion is None:
+    if _CrewAILLM is None:
         _log.error(
-            "triage: LiteLLM not importable, skipping triage for %d item(s). "
+            "triage: crewai not importable, skipping triage for %d item(s). "
             "ImportError was: %s",
             len(items),
-            _LITELLM_IMPORT_ERROR,
+            _CREWAI_IMPORT_ERROR,
         )
         return []
 
     model = resolve_model_for_litellm(cfg.model, cfg.base_url, cfg.provider)
     _log.debug(
-        "triage: dispatching via LiteLLM model=%s base_url=%s provider=%s",
+        "triage: dispatching via crewai.LLM model=%s base_url=%s provider=%s",
         model, cfg.base_url, cfg.provider,
     )
     system = (
@@ -110,26 +114,26 @@ def llm_triage_batch(
         "Use empty dismiss if none apply."
     )
     try:
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "api_key": cfg.api_key,
-            "temperature": min(cfg.temperature, 0.3),
-            "messages": [
+        # Construct LLM with the same shape :func:`build_llm` uses, so the
+        # triage call inherits whatever fix the main agent path needs (e.g.
+        # the ``anthropic/`` prefix added by ``resolve_model_for_litellm``).
+        llm_kwargs: dict[str, Any] = dict(cfg.extra)
+        llm_kwargs["api_key"] = cfg.api_key
+        llm_kwargs["temperature"] = min(cfg.temperature, 0.3)
+        if cfg.base_url:
+            llm_kwargs["base_url"] = cfg.base_url
+        if cfg.provider:
+            llm = _CrewAILLM(model=model, provider=cfg.provider, **llm_kwargs)
+        else:
+            llm = _CrewAILLM(model=model, **llm_kwargs)
+        # crewai.LLM.call returns the model's response as a string directly.
+        content = llm.call(
+            messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
-            ],
-            "timeout": timeout_s,
-        }
-        if cfg.base_url:
-            kwargs["base_url"] = cfg.base_url
-        response = _litellm_completion(**kwargs)
-        # LiteLLM normalizes responses to the OpenAI shape across providers.
-        choices = getattr(response, "choices", None) or []
-        if not choices:
-            return []
-        message = getattr(choices[0], "message", None)
-        content = (getattr(message, "content", None) or "") if message else ""
-        if not isinstance(content, str):
+            ]
+        )
+        if not isinstance(content, str) or not content:
             return []
         parsed = _extract_json_object(content)
         if not parsed:

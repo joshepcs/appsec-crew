@@ -1,74 +1,66 @@
 """Triage routing tests.
 
 The triage step previously POSTed raw OpenAI ``/v1/chat/completions`` regardless
-of YAML config — so an Anthropic-keyed run silently got 401 and returned 0
-dismissals. The new implementation dispatches via LiteLLM so the YAML model
-prefix and base_url govern the destination, identically to how the main
-agents are built (:func:`appsec_crew.utils.llm.build_llm`).
+of YAML config — Anthropic-keyed runs got 401 silently and returned 0 dismissals.
+The next iteration tried ``litellm.completion`` directly but that broke in
+CI because crewai 1.10+ no longer ships LiteLLM as a transitive dep
+(``ModuleNotFoundError: No module named 'litellm'``).
+
+The current implementation reuses ``crewai.LLM`` (already installed and used
+by the agent path) so the YAML model prefix and base_url govern the
+destination identically to :func:`appsec_crew.utils.llm.build_llm`.
 """
 
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from appsec_crew.settings import LlmAgentConfig
 from appsec_crew.triage_llm import llm_triage_batch
 
 
-def _stub_response(content: str):
-    """Mimic the LiteLLM/OpenAI response shape with one choice's message.content."""
-    class _Msg:
-        def __init__(self, c: str) -> None:
-            self.content = c
+def _make_llm_class(content_to_return: str):
+    """Return a class that mimics ``crewai.LLM``: constructible with kwargs,
+    has a ``.call(messages=...)`` method that returns a string."""
+    captured: dict = {}
 
-    class _Choice:
-        def __init__(self, c: str) -> None:
-            self.message = _Msg(c)
+    class _FakeLLM:
+        def __init__(self, **kwargs) -> None:
+            captured["init"] = kwargs
 
-    class _Resp:
-        def __init__(self, c: str) -> None:
-            self.choices = [_Choice(c)]
+        def call(self, messages, **_kw):
+            captured["messages"] = messages
+            return content_to_return
 
-    return _Resp(content)
+    return _FakeLLM, captured
 
 
 def test_triage_routes_claude_via_anthropic_prefix() -> None:
-    """A bare ``claude-*`` model in YAML must reach LiteLLM as ``anthropic/claude-*``,
-    not as a raw model string posted to OpenAI."""
+    """A bare ``claude-*`` model in YAML must reach crewai.LLM as
+    ``anthropic/claude-*`` so the native dispatcher picks the Anthropic
+    provider (without the prefix it falls through to OpenAI and 401s)."""
     cfg = LlmAgentConfig(model="claude-sonnet-4-6", api_key="sk-ant-xxx", temperature=0)
-    captured = {}
+    fake_cls, captured = _make_llm_class('{"dismiss": []}')
 
-    def fake_completion(**kw):
-        captured.update(kw)
-        return _stub_response('{"dismiss": []}')
-
-    with patch("appsec_crew.triage_llm._litellm_completion", side_effect=fake_completion):
+    with patch("appsec_crew.triage_llm._CrewAILLM", fake_cls):
         out = llm_triage_batch(cfg, agent_role="x", items=[{"index": 0}], guidance="g")
 
     assert out == []
-    # The model string sent to LiteLLM must include the anthropic/ prefix so
-    # LiteLLM dispatches to api.anthropic.com (not api.openai.com).
-    assert captured["model"] == "anthropic/claude-sonnet-4-6"
-    # The Anthropic key is forwarded as `api_key`, not as a Bearer header.
-    assert captured["api_key"] == "sk-ant-xxx"
-    # No base_url override means LiteLLM picks the provider default.
-    assert "base_url" not in captured
+    init = captured["init"]
+    assert init["model"] == "anthropic/claude-sonnet-4-6"
+    assert init["api_key"] == "sk-ant-xxx"
+    assert "base_url" not in init
 
 
 def test_triage_routes_gpt_models_to_openai_default() -> None:
     cfg = LlmAgentConfig(model="gpt-4o-mini", api_key="sk-openai", temperature=0)
-    captured = {}
+    fake_cls, captured = _make_llm_class('{"dismiss": []}')
 
-    def fake_completion(**kw):
-        captured.update(kw)
-        return _stub_response('{"dismiss": []}')
-
-    with patch("appsec_crew.triage_llm._litellm_completion", side_effect=fake_completion):
+    with patch("appsec_crew.triage_llm._CrewAILLM", fake_cls):
         llm_triage_batch(cfg, agent_role="x", items=[{"index": 0}], guidance="g")
 
-    # gpt-* models pass through unprefixed; LiteLLM will dispatch to OpenAI.
-    assert captured["model"] == "gpt-4o-mini"
+    assert captured["init"]["model"] == "gpt-4o-mini"
 
 
 def test_triage_honors_base_url_for_compatible_endpoints() -> None:
@@ -78,25 +70,28 @@ def test_triage_honors_base_url_for_compatible_endpoints() -> None:
         base_url="https://models.github.ai/inference",
         temperature=0,
     )
-    captured = {}
+    fake_cls, captured = _make_llm_class('{"dismiss": []}')
 
-    def fake_completion(**kw):
-        captured.update(kw)
-        return _stub_response('{"dismiss": []}')
-
-    with patch("appsec_crew.triage_llm._litellm_completion", side_effect=fake_completion):
+    with patch("appsec_crew.triage_llm._CrewAILLM", fake_cls):
         llm_triage_batch(cfg, agent_role="x", items=[{"index": 0}], guidance="g")
 
-    # base_url present → bypass _resolve_model auto-prefixing AND forward base_url.
-    assert captured["model"] == "gpt-4o-mini"
-    assert captured["base_url"] == "https://models.github.ai/inference"
+    init = captured["init"]
+    assert init["model"] == "gpt-4o-mini"
+    assert init["base_url"] == "https://models.github.ai/inference"
 
 
-def test_triage_returns_empty_when_completion_raises() -> None:
-    """Fail-open: any LLM error keeps every finding instead of silently
-    dropping them. Network errors, schema mismatches, anything."""
+def test_triage_returns_empty_when_call_raises() -> None:
+    """Fail-open: any LLM error keeps every finding."""
     cfg = LlmAgentConfig(model="claude-haiku-4-5", api_key="x", temperature=0)
-    with patch("appsec_crew.triage_llm._litellm_completion", side_effect=RuntimeError("network")):
+
+    class _BoomLLM:
+        def __init__(self, **_kw) -> None:
+            pass
+
+        def call(self, messages, **_kw):
+            raise RuntimeError("network")
+
+    with patch("appsec_crew.triage_llm._CrewAILLM", _BoomLLM):
         out = llm_triage_batch(cfg, agent_role="x", items=[{"index": 0}], guidance="g")
     assert out == []
 
@@ -113,11 +108,11 @@ def test_triage_parses_dismiss_array_with_reasons() -> None:
             ]
         }
     )
-    with patch(
-        "appsec_crew.triage_llm._litellm_completion",
-        return_value=_stub_response(body),
-    ):
-        out = llm_triage_batch(cfg, agent_role="x", items=[{"index": i} for i in range(5)], guidance="g")
+    fake_cls, _ = _make_llm_class(body)
+    with patch("appsec_crew.triage_llm._CrewAILLM", fake_cls):
+        out = llm_triage_batch(
+            cfg, agent_role="x", items=[{"index": i} for i in range(5)], guidance="g"
+        )
 
     assert {row["index"] for row in out} == {0, 2}
     assert all("reason" in row for row in out)
@@ -125,17 +120,29 @@ def test_triage_parses_dismiss_array_with_reasons() -> None:
 
 
 def test_triage_empty_items_short_circuits() -> None:
-    """Don't waste a roundtrip when there's nothing to triage."""
     cfg = LlmAgentConfig(model="claude-haiku-4-5", api_key="x")
-    with patch("appsec_crew.triage_llm._litellm_completion") as fake:
+    sentinel = MagicMock()
+    with patch("appsec_crew.triage_llm._CrewAILLM", sentinel):
         out = llm_triage_batch(cfg, agent_role="x", items=[], guidance="g")
     assert out == []
-    fake.assert_not_called()
+    sentinel.assert_not_called()
 
 
 def test_triage_no_api_key_short_circuits() -> None:
     cfg = LlmAgentConfig(model="claude-haiku-4-5", api_key="")
-    with patch("appsec_crew.triage_llm._litellm_completion") as fake:
+    sentinel = MagicMock()
+    with patch("appsec_crew.triage_llm._CrewAILLM", sentinel):
         out = llm_triage_batch(cfg, agent_role="x", items=[{"index": 0}], guidance="g")
     assert out == []
-    fake.assert_not_called()
+    sentinel.assert_not_called()
+
+
+def test_triage_returns_empty_when_crewai_not_importable() -> None:
+    """If crewai itself is missing (stripped-down dev env, broken install),
+    the triage logs an ERROR and fails-open. This is the regression that
+    showed up in CI when LiteLLM wasn't a transitive crewai dep anymore —
+    we want a loud signal instead of silently '0 dismissals'."""
+    cfg = LlmAgentConfig(model="claude-sonnet-4-6", api_key="sk-x")
+    with patch("appsec_crew.triage_llm._CrewAILLM", None):
+        out = llm_triage_batch(cfg, agent_role="x", items=[{"index": 0}], guidance="g")
+    assert out == []
