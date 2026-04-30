@@ -1,24 +1,33 @@
-# AppSec Crew — example config: GitHub Models (Copilot via the OpenAI-compatible REST API)
+# AppSec Crew — example config: GitHub Models (Copilot's OpenAI-compatible REST API)
 #
 # IMPORTANT — what this is and what it isn't:
 #
-#   This config targets **GitHub Models** (https://github.com/marketplace/models), the
-#   OpenAI-compatible inference endpoint that ships with any GitHub account.
+#   This config targets **GitHub Models** (https://github.com/marketplace/models),
+#   the OpenAI-compatible inference endpoint that ships with any GitHub account.
 #   It is the supported, programmatic path for inference using a GitHub PAT.
 #
-#   This is NOT the GitHub Copilot Chat API (api.githubcopilot.com). That endpoint
-#   is non-public and intended for first-party clients (VS Code, JetBrains, Copilot CLI)
-#   authenticated via OAuth device flow. Using it programmatically requires
-#   reverse-engineered token handling and is generally outside Copilot Business ToS.
+#   This is NOT the GitHub Copilot Chat API (api.githubcopilot.com). That
+#   endpoint is non-public and intended for first-party clients (VS Code,
+#   JetBrains, Copilot CLI) authenticated via OAuth device flow. Using it
+#   programmatically requires reverse-engineered token handling and is
+#   generally outside Copilot Business ToS.
 #
-# Why this works without any code changes:
-#   - Models are written `github/<model_id>`. The slash means `_resolve_model` in
-#     src/appsec_crew/utils/llm.py leaves them untouched (no Anthropic prefix
-#     injection), and LiteLLM dispatches them to the GH Models endpoint based on
-#     the `github/` provider prefix.
-#   - Auth uses GITHUB_TOKEN (the same token already provided by `actions/checkout`)
-#     plus the `models:read` permission. For private repos you may want a PAT in a
-#     dedicated secret (e.g. GH_MODELS_TOKEN); change `api_key_env` accordingly.
+# Why this config uses `model + base_url` (and NOT `model: github/<id>`):
+#
+#   CrewAI 1.10+ ships its own OpenAI / Anthropic native providers and dropped
+#   LiteLLM as a transitive dependency. The `github/` provider prefix that
+#   LiteLLM understood is therefore not dispatched anywhere by the CrewAI
+#   native LLM class — calls would silently fail.
+#
+#   The reliable form is the OpenAI-compatible REST shape:
+#     - `model:` is a bare model id (`gpt-4o-mini`, `gpt-4o`, etc.).
+#     - `base_url:` points to the GH Models inference endpoint.
+#     - `api_key_env: GITHUB_TOKEN` (with `models:read` scope) authenticates.
+#
+#   crewai.LLM with this shape uses its native OpenAI provider against the
+#   GitHub-hosted endpoint — same wire format, different URL. The agents AND
+#   the LLM-triage step both honor `base_url` consistently
+#   (`appsec_crew.utils.llm.build_llm` and `appsec_crew.triage_llm`).
 #
 # Workflow snippet (.github/workflows/appsec-crew-pr.yml):
 #
@@ -26,29 +35,21 @@
 #       contents: read
 #       issues: write
 #       pull-requests: write
-#       models: read           # <-- required for github/* models
+#       models: read           # required for GH Models inference
 #     env:
 #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 #       GITHUB_REPOSITORY: ${{ github.repository }}
 #
+#   For private repos that need a PAT (rather than the action-scoped
+#   GITHUB_TOKEN), provision a secret like GH_MODELS_TOKEN and switch each
+#   `api_key_env: GITHUB_TOKEN` below to `api_key_env: GH_MODELS_TOKEN`.
+#
 # Trade-offs vs. OpenAI direct:
 #   - + Free tier: no separate billing relationship, no extra secret to provision.
 #   - + Same auth as the rest of the workflow (one less rotation surface).
-#   - − Rate limits are per-account, generous for CI but not unlimited.
+#   - − Rate limits are per-account; generous for CI but not unlimited.
 #   - − The model catalogue rotates: pin a known-good model id and watch the
 #     marketplace for deprecation notices.
-#
-# Alternate routing (if `github/<model>` ever stops working with your LiteLLM
-# version): replace each `model:` line with the explicit base_url form, e.g.
-#
-#     llm:
-#       model: gpt-4o-mini
-#       base_url: https://models.github.ai/inference
-#       api_key_env: GITHUB_TOKEN
-#
-# `build_llm` propagates `base_url` to LiteLLM's `LLM(...)` and bypasses
-# `_resolve_model`'s auto-prefix logic, so the call goes straight to the GH
-# Models endpoint with the OpenAI client wire format.
 
 global:
   min_severity: high
@@ -59,7 +60,8 @@ agents:
   secrets_reviewer:
     enabled: true
     llm:
-      model: github/gpt-4o-mini
+      model: gpt-4o-mini
+      base_url: https://models.github.ai/inference
       api_key_env: GITHUB_TOKEN
       temperature: 0
     tools:
@@ -70,7 +72,8 @@ agents:
   dependencies_reviewer:
     enabled: true
     llm:
-      model: github/gpt-4o-mini
+      model: gpt-4o-mini
+      base_url: https://models.github.ai/inference
       api_key_env: GITHUB_TOKEN
       temperature: 0
     tools:
@@ -81,7 +84,8 @@ agents:
   code_reviewer:
     enabled: true
     llm:
-      model: github/gpt-4o                # bigger model for SAST triage; falls within the free tier
+      model: gpt-4o                       # bigger model for SAST triage; falls within the free tier
+      base_url: https://models.github.ai/inference
       api_key_env: GITHUB_TOKEN
       temperature: 0
     tools:
@@ -97,7 +101,8 @@ agents:
   reporter:
     enabled: true
     llm:
-      model: github/gpt-4o-mini
+      model: gpt-4o-mini
+      base_url: https://models.github.ai/inference
       api_key_env: GITHUB_TOKEN
       temperature: 0
     tools:
