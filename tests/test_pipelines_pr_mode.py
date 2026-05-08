@@ -848,3 +848,175 @@ def test_review_does_not_filter_when_pr_files_endpoint_fails() -> None:
     payload = gh.create_pull_request_review.call_args.kwargs
     assert len(payload["comments"]) == 1
     assert payload["comments"][0]["path"] == "any/file.py"
+
+
+# ---------------------------------------------------------------------------
+# Reporter PR-mode review event behavior
+#
+# In PR scan mode, the reporter posts the AppSec Crew summary as a PR *review*
+# (not a plain issue comment). The review event is REQUEST_CHANGES when there
+# are actionable findings (so the merge is blocked under branch protection
+# that requires approvals), and COMMENT otherwise.
+# ---------------------------------------------------------------------------
+def _reporter_cfg(tmp: Path) -> Path:
+    return _cfg(
+        tmp,
+        {
+            "secrets_reviewer": {"enabled": True, "llm": {"api_key": "k"}, "tools": {"betterleaks": {}}},
+            "dependencies_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"osv_scanner": {}}},
+            "code_reviewer": {"enabled": False, "llm": {"api_key": "k"}, "tools": {"semgrep": {}}},
+            "reporter": {
+                "enabled": True,
+                "llm": {"api_key": "k"},
+                "tools": {"jira": {"enabled": False}, "webhook": {"enabled": False}, "splunk": {"enabled": False}},
+            },
+        },
+    )
+
+
+def test_reporter_pr_review_requests_changes_when_findings_actionable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With 1+ actionable finding, the reporter posts a PR review with
+    ``event=REQUEST_CHANGES`` so branch protection blocks the merge."""
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _reporter_cfg(tmp_path)
+    ctx = _ctx(tmp_path, cfg, pr_number=42, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {
+        "executed": True,
+        "skipped": False,
+        "findings_after_triage": 2,  # actionable
+        "issue_urls": [],
+        "scanner_findings_total": 2,
+        "dismissed_findings": [],
+        "commands_executed": [],
+        "pr_scan_mode": True,
+    }
+
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "feedface" * 5}}
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/42#pullrequestreview-9"
+    }
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: gh)
+
+    run_reporter_pipeline(ctx)
+
+    gh.create_pull_request_review.assert_called_once()
+    payload = gh.create_pull_request_review.call_args
+    assert payload.kwargs["event"] == "REQUEST_CHANGES"
+    assert payload.kwargs["commit_id"] == "feedface" * 5
+    assert "Pull request check failed" in payload.kwargs["body"]
+    # Reporter must not double-post: no plain issue comment on top of the review.
+    gh.create_pr_comment.assert_not_called()
+
+
+def test_reporter_pr_review_comments_when_no_actionable_findings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With 0 actionable findings, the reporter posts a PR review with
+    ``event=COMMENT`` — informational only, does not block merge."""
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _reporter_cfg(tmp_path)
+    ctx = _ctx(tmp_path, cfg, pr_number=43, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {
+        "executed": True,
+        "skipped": False,
+        "findings_after_triage": 0,  # nothing actionable
+        "issue_urls": [],
+        "scanner_findings_total": 0,
+        "dismissed_findings": [],
+        "commands_executed": [],
+        "pr_scan_mode": True,
+    }
+
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "cafebabe" * 5}}
+    gh.create_pull_request_review.return_value = {
+        "html_url": "https://github.com/o/r/pull/43#pullrequestreview-10"
+    }
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: gh)
+
+    run_reporter_pipeline(ctx)
+
+    gh.create_pull_request_review.assert_called_once()
+    payload = gh.create_pull_request_review.call_args
+    assert payload.kwargs["event"] == "COMMENT"
+    assert payload.kwargs["commit_id"] == "cafebabe" * 5
+    gh.create_pr_comment.assert_not_called()
+
+
+def test_reporter_falls_back_to_issue_comment_when_head_sha_unresolvable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If ``get_pull_request`` raises (transient API error, missing
+    permissions), the reporter falls back to a plain issue comment so the
+    summary still lands somewhere visible. No review is attempted."""
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _reporter_cfg(tmp_path)
+    ctx = _ctx(tmp_path, cfg, pr_number=44, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {
+        "executed": True,
+        "skipped": False,
+        "findings_after_triage": 1,
+        "issue_urls": [],
+        "scanner_findings_total": 1,
+        "dismissed_findings": [],
+        "commands_executed": [],
+        "pr_scan_mode": True,
+    }
+
+    gh = MagicMock()
+    gh.get_pull_request.side_effect = RuntimeError("502 from GitHub")
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: gh)
+
+    run_reporter_pipeline(ctx)
+
+    gh.create_pull_request_review.assert_not_called()
+    gh.create_pr_comment.assert_called_once()
+    args, _kwargs = gh.create_pr_comment.call_args
+    assert args[0] == 44
+    assert "Pull request check failed" in args[1]
+
+
+def test_reporter_falls_back_to_issue_comment_on_review_api_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If ``create_pull_request_review`` raises (e.g. 422 on bot's own PR),
+    the reporter still posts the summary as a plain issue comment."""
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    cfg = _reporter_cfg(tmp_path)
+    ctx = _ctx(tmp_path, cfg, pr_number=45, event_name="pull_request")
+    ctx.state["secrets_reviewer"] = {
+        "executed": True,
+        "skipped": False,
+        "findings_after_triage": 1,
+        "issue_urls": [],
+        "scanner_findings_total": 1,
+        "dismissed_findings": [],
+        "commands_executed": [],
+        "pr_scan_mode": True,
+    }
+
+    gh = MagicMock()
+    gh.get_pull_request.return_value = {"head": {"sha": "deadbeef" * 5}}
+    gh.create_pull_request_review.side_effect = RuntimeError(
+        "422 Can not request changes on your own pull request"
+    )
+    monkeypatch.setattr("appsec_crew.pipelines._github_client", lambda _s: gh)
+
+    run_reporter_pipeline(ctx)
+
+    gh.create_pull_request_review.assert_called_once()
+    gh.create_pr_comment.assert_called_once()
+    args, _kwargs = gh.create_pr_comment.call_args
+    assert args[0] == 45
+    assert "Pull request check failed" in args[1]

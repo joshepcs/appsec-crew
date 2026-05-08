@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from appsec_crew.integrations.github_api import GitHubApi
 
 
@@ -53,3 +55,42 @@ def test_find_open_issue_skips_pull_request_entries() -> None:
         with patch("httpx.post", return_value=post_resp):
             issue, created = api.create_issue_deduped("Same", "b", labels=None)
     assert created is True
+
+
+def test_create_pull_request_review_default_event_is_comment() -> None:
+    """Backwards compatibility: callers without ``event=`` keep the old behaviour."""
+    api = GitHubApi("tok", "o/r", "https://api.github.com")
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    post_resp.json.return_value = {"html_url": "https://github.com/o/r/pull/5#review-1", "id": 1}
+    with patch("httpx.post", return_value=post_resp) as p:
+        api.create_pull_request_review(5, commit_id="abc123", body="hi")
+    p.assert_called_once()
+    payload = p.call_args.kwargs["json"]
+    assert payload["event"] == "COMMENT"
+    assert payload["commit_id"] == "abc123"
+    assert payload["body"] == "hi"
+    assert "comments" not in payload
+
+
+def test_create_pull_request_review_accepts_request_changes_event() -> None:
+    """Reporter path passes ``REQUEST_CHANGES`` to block merge when findings exist."""
+    api = GitHubApi("tok", "o/r", "https://api.github.com")
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    post_resp.json.return_value = {"html_url": "https://github.com/o/r/pull/5#review-2", "id": 2}
+    with patch("httpx.post", return_value=post_resp) as p:
+        api.create_pull_request_review(
+            5, commit_id="abc123", body="findings present", event="REQUEST_CHANGES"
+        )
+    payload = p.call_args.kwargs["json"]
+    assert payload["event"] == "REQUEST_CHANGES"
+
+
+def test_create_pull_request_review_rejects_invalid_event() -> None:
+    """Defensive: an obvious typo (e.g. ``REJECT``) raises before hitting the API."""
+    api = GitHubApi("tok", "o/r", "https://api.github.com")
+    with patch("httpx.post") as p:
+        with pytest.raises(ValueError, match="Invalid review event"):
+            api.create_pull_request_review(5, commit_id="abc", body="x", event="REJECT")
+    p.assert_not_called()

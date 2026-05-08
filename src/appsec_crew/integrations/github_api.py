@@ -153,11 +153,27 @@ class GitHubApi:
         commit_id: str,
         body: str,
         comments: list[dict[str, Any]] | None = None,
+        event: str = "COMMENT",
     ) -> dict[str, Any]:
-        """Submit a PR review (``event=COMMENT``). Optional inline ``comments``: ``path``, ``line``, ``body``."""
+        """Submit a PR review.
+
+        ``event`` may be one of ``COMMENT`` (default — informational, does not
+        affect mergeability), ``REQUEST_CHANGES`` (blocks merge under branch
+        protection rules that require approvals), ``APPROVE``, or ``PENDING``
+        (draft, not published).
+
+        Optional inline ``comments`` are objects with ``path``, ``line``, ``body``.
+
+        Note: GitHub rejects ``REQUEST_CHANGES`` / ``APPROVE`` on a reviewer's own
+        pull request with ``422 Can not request changes / approve on your own pull
+        request``. Callers should fall back to ``COMMENT`` (or skip the review) in
+        that case.
+        """
+        if event not in ("COMMENT", "REQUEST_CHANGES", "APPROVE", "PENDING"):
+            raise ValueError(f"Invalid review event: {event!r}")
         payload: dict[str, Any] = {
             "commit_id": commit_id,
-            "event": "COMMENT",
+            "event": event,
             "body": body,
         }
         if comments:

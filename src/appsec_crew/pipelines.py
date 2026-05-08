@@ -1588,6 +1588,75 @@ def _markdown_report(ctx: RuntimeContext) -> str:
     return _markdown_report_batch(ctx)
 
 
+def _post_reporter_to_pr(gh: GitHubApi, ctx: RuntimeContext, body: str) -> None:
+    """Post the reporter summary on the PR.
+
+    In PR scan mode the summary is submitted as a **PR review** with
+    ``event=REQUEST_CHANGES`` when there are actionable findings (secrets,
+    dependencies, or code) after severity filter and triage; otherwise as
+    ``event=COMMENT``. ``REQUEST_CHANGES`` blocks merge under branch
+    protection rules that require approvals.
+
+    Stale ``REQUEST_CHANGES`` reviews from prior runs are NOT auto-dismissed
+    by AppSec Crew. Configure branch protection with **"Dismiss stale pull
+    request approvals when new commits are pushed"** so that the next push
+    invalidates them automatically.
+
+    Falls back to a plain issue comment if the PR head sha cannot be
+    resolved or the review API rejects the call (e.g. ``422 Can not request
+    changes on your own pull request`` when a bot opens the PR itself).
+    """
+    pr_number = int(ctx.pr_number)  # type: ignore[arg-type]
+
+    commit_id: str | None = None
+    try:
+        pr = gh.get_pull_request(pr_number)
+        commit_id = ((pr.get("head") or {}).get("sha")) or None
+    except Exception as e:
+        _review_log.warning(
+            "reporter-review: could not fetch PR head sha: %r — falling back to issue comment", e
+        )
+
+    if not commit_id:
+        gh.create_pr_comment(pr_number, body)
+        return
+
+    if _is_pr_scan_mode(ctx) and pr_scan_has_actionable_findings(ctx):
+        review_event = "REQUEST_CHANGES"
+    else:
+        review_event = "COMMENT"
+
+    _review_log.info(
+        "reporter-review: posting event=%s commit_id=%s body_len=%d",
+        review_event, commit_id[:8], len(body),
+    )
+
+    try:
+        gh.create_pull_request_review(
+            pr_number,
+            commit_id=commit_id,
+            body=body,
+            event=review_event,
+        )
+    except Exception as e:
+        resp_body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                resp_body = resp.text[:2000]
+            except Exception:
+                resp_body = "(could not read response body)"
+        _review_log.error(
+            "reporter-review: create_pull_request_review FAILED: %r | response_body=%s "
+            "— falling back to issue comment",
+            e, resp_body,
+        )
+        try:
+            gh.create_pr_comment(pr_number, body)
+        except Exception as e2:
+            _review_log.error("reporter-review: fallback issue comment ALSO failed: %r", e2)
+
+
 def run_reporter_pipeline(ctx: RuntimeContext) -> str:
     s = ctx.settings
     if not s.reporter.enabled:
@@ -1600,7 +1669,7 @@ def run_reporter_pipeline(ctx: RuntimeContext) -> str:
 
     gh = _github_client(s)
     if gh and ctx.pr_number:
-        gh.create_pr_comment(ctx.pr_number, text)
+        _post_reporter_to_pr(gh, ctx, text)
 
     repo_name = os.environ.get("GITHUB_REPOSITORY") or "unknown"
     rep = s.reporter
